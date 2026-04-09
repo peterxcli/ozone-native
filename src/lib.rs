@@ -4,6 +4,7 @@ mod error;
 mod om;
 pub mod proto;
 mod ratis;
+mod ratis_stream;
 mod retry_window;
 mod util;
 

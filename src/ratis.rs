@@ -4,6 +4,7 @@ use crate::proto::hadoop::hdds::datanode;
 use crate::proto::ratis::common;
 use crate::proto::ratis::common::raft_client_reply_proto::ExceptionDetails;
 use crate::proto::ratis::common::raft_client_request_proto::Type as RequestType;
+use crate::ratis_stream::UnorderedRequestManager;
 use crate::proto::ratis::grpc::raft_client_protocol_service_client::RaftClientProtocolServiceClient;
 use crate::util::{
     datanode_ratis_client_address, datanode_uuid_string, encode_container_command_message,
@@ -11,7 +12,10 @@ use crate::util::{
 };
 use bytes::Bytes;
 use prost::Message;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::time::{sleep, Duration};
 use tokio_stream::iter;
 use tonic::transport::Channel;
@@ -19,7 +23,7 @@ use uuid::Uuid;
 
 pub struct RatisClient {
     client_id: Uuid,
-    next_call_id: AtomicU64,
+    next_call_id: Arc<AtomicU64>,
     host_override: Option<String>,
 }
 
@@ -27,7 +31,7 @@ impl Default for RatisClient {
     fn default() -> Self {
         Self {
             client_id: Uuid::new_v4(),
-            next_call_id: AtomicU64::new(1),
+            next_call_id: Arc::new(AtomicU64::new(1)),
             host_override: None,
         }
     }
@@ -39,6 +43,19 @@ impl RatisClient {
             host_override,
             ..Self::default()
         }
+    }
+
+    pub async fn open_unordered_stream(
+        &self,
+        pipeline: &hdds::Pipeline,
+    ) -> Result<UnorderedRequestManager> {
+        UnorderedRequestManager::connect(
+            self.client_id,
+            Arc::clone(&self.next_call_id),
+            pipeline,
+            self.host_override.clone(),
+        )
+        .await
     }
 
     pub async fn write_container_command(
