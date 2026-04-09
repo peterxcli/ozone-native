@@ -1,6 +1,7 @@
+use crate::block_writer::BlockWriter;
 use crate::datanode::DatanodeClient;
 use crate::error::{Error, Result};
-use crate::om::{KeyReplication, OmClient};
+use crate::om::{BlockAllocateExcludeList, KeyReplication, OmClient};
 use crate::proto::hadoop::hdds::datanode;
 use crate::proto::hadoop::ozone::{self, BasicKeyInfo, BucketLayoutProto};
 use crate::ratis::RatisClient;
@@ -161,7 +162,8 @@ impl OzoneClient {
         let mut written = 0usize;
 
         while written < data.len() {
-            if pending.is_empty() {
+            let pending_lengths = pending.iter().map(|location| location.length).collect::<Vec<_>>();
+            if should_allocate_new_block(&pending_lengths, written, data.len()) {
                 pending.push(
                     self.om
                         .allocate_block(
@@ -171,6 +173,7 @@ impl OzoneClient {
                             data.len() as u64,
                             open.id,
                             &replication,
+                            None,
                         )
                         .await?,
                 );
@@ -184,20 +187,39 @@ impl OzoneClient {
             };
             let block_len = capacity.min(data.len() - written);
             let block_data = &data[written..written + block_len];
+            let mut current_location = location;
+            let mut exclude = BlockAllocateExcludeList::default();
+            let mut attempt = 0usize;
 
-            let log_index = self.write_block(&location, block_data).await?;
-            if self.config.watch_for_commit {
-                let pipeline = location
-                    .pipeline
-                    .as_ref()
-                    .ok_or(Error::MissingField("key_location.pipeline"))?;
-                self.ratis.watch(pipeline, log_index).await?;
+            loop {
+                let writer = BlockWriter::new(&self.ratis, &self.config, &current_location).await?;
+                match writer.write_all(block_data).await {
+                    Ok(locations) => {
+                        committed.extend(locations);
+                        break;
+                    }
+                    Err(err) if attempt < self.config.max_write_retries => {
+                        if let Some(pipeline) = current_location.pipeline.as_ref() {
+                            exclude.pipeline_ids.push(pipeline.id.clone());
+                        }
+                        attempt += 1;
+                        current_location = self
+                            .om
+                            .allocate_block(
+                                volume,
+                                bucket,
+                                key,
+                                data.len() as u64,
+                                open.id,
+                                &replication,
+                                Some(&exclude),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
-
-            let mut committed_location = location.clone();
-            committed_location.offset = 0;
-            committed_location.length = block_len as u64;
-            committed.push(committed_location);
             written += block_len;
         }
 
@@ -485,6 +507,11 @@ fn should_descend_fso_directory(directory: &str, requested_prefix: &str) -> bool
         || requested_prefix.starts_with(directory)
 }
 
+fn should_allocate_new_block(pending_block_lengths: &[u64], written: usize, total_len: usize) -> bool {
+    let _ = (written, total_len);
+    pending_block_lengths.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +529,15 @@ mod tests {
         assert!(should_descend_fso_directory("dir/sub", "dir"));
         assert!(should_descend_fso_directory("test", "te"));
         assert!(!should_descend_fso_directory("other", "dir/file.txt"));
+    }
+
+    #[test]
+    fn allocates_new_block_when_preallocated_list_is_empty() {
+        assert!(should_allocate_new_block(&[], 1024, 1024));
+    }
+
+    #[test]
+    fn reuses_preallocated_block_when_available() {
+        assert!(!should_allocate_new_block(&[8], 0, 8));
     }
 }

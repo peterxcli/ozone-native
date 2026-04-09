@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::proto::hadoop::hdds;
 use crate::proto::ratis::common;
+use crate::proto::ratis::common::raft_client_reply_proto::ExceptionDetails;
 use crate::proto::ratis::common::raft_client_request_proto::Type as RequestType;
 use crate::proto::ratis::grpc::raft_client_protocol_service_client::RaftClientProtocolServiceClient;
 use crate::util::{
@@ -18,6 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
 use uuid::Uuid;
+
+pub type PendingReply = oneshot::Receiver<Result<StreamReply>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestStreamState {
@@ -62,7 +65,7 @@ pub struct PendingReplies {
 }
 
 impl PendingReplies {
-    pub fn insert(&mut self, call_id: u64) -> oneshot::Receiver<Result<StreamReply>> {
+    pub fn insert(&mut self, call_id: u64) -> PendingReply {
         let (tx, rx) = oneshot::channel();
         self.waiters.insert(call_id, tx);
         rx
@@ -149,7 +152,18 @@ impl UnorderedRequestManager {
                         let result = StreamReply::from_proto(reply_proto);
                         match result {
                             Ok((call_id, reply)) => {
-                                task_pending.lock().await.complete(call_id, Ok(reply));
+                                let success = reply
+                                    .proto
+                                    .rpc_reply
+                                    .as_ref()
+                                    .map(|rpc| rpc.success)
+                                    .unwrap_or(false);
+                                if success {
+                                    task_pending.lock().await.complete(call_id, Ok(reply));
+                                } else {
+                                    let err = ratis_reply_error(&reply.proto);
+                                    task_pending.lock().await.complete(call_id, Err(err));
+                                }
                             }
                             Err(err) => {
                                 task_pending
@@ -194,6 +208,17 @@ impl UnorderedRequestManager {
         request_type: RequestType,
         message: Option<Bytes>,
     ) -> Result<StreamReply> {
+        let receiver = self.send_async(request_type, message).await?;
+        receiver
+            .await
+            .map_err(|_| Error::Ratis("ratis reply channel closed".to_string()))?
+    }
+
+    pub async fn send_async(
+        &self,
+        request_type: RequestType,
+        message: Option<Bytes>,
+    ) -> Result<PendingReply> {
         if *self.state.lock().await == RequestStreamState::Closed {
             return Err(Error::Ratis("ratis stream closed".to_string()));
         }
@@ -201,14 +226,24 @@ impl UnorderedRequestManager {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         let request = self.build_request(call_id, request_type, message);
         let receiver = self.pending.lock().await.insert(call_id);
-        self.request_tx
+        if self
+            .request_tx
             .send(request)
             .await
-            .map_err(|_| Error::Ratis("failed to send request on ratis stream".to_string()))?;
+            .is_err()
+        {
+            self.pending.lock().await.complete(
+                call_id,
+                Err(Error::Ratis(
+                    "failed to send request on ratis stream".to_string(),
+                )),
+            );
+            return Err(Error::Ratis(
+                "failed to send request on ratis stream".to_string(),
+            ));
+        }
 
-        receiver
-            .await
-            .map_err(|_| Error::Ratis("ratis reply channel closed".to_string()))?
+        Ok(receiver)
     }
 
     fn build_request(
@@ -235,6 +270,39 @@ impl UnorderedRequestManager {
             message: message.map(|content| common::ClientMessageEntryProto { content }),
             r#type: Some(request_type),
         }
+    }
+}
+
+fn ratis_reply_error(reply: &common::RaftClientReplyProto) -> Error {
+    match &reply.exception_details {
+        Some(ExceptionDetails::NotLeaderException(not_leader)) => Error::Ratis(format!(
+            "not leader; suggested_leader_present={} peers_in_conf={}",
+            not_leader.suggested_leader.is_some(),
+            not_leader.peers_in_conf.len()
+        )),
+        Some(ExceptionDetails::LeaderNotReadyException(_)) => {
+            Error::Ratis("leader not ready".to_string())
+        }
+        Some(ExceptionDetails::StateMachineException(err)) => {
+            Error::Ratis(format!("{}: {}", err.exception_class_name, err.error_msg))
+        }
+        Some(ExceptionDetails::AlreadyClosedException(err)) => {
+            Error::Ratis(format!("{}: {}", err.exception_class_name, err.error_msg))
+        }
+        Some(ExceptionDetails::NotReplicatedException(err)) => Error::Ratis(format!(
+            "not replicated to {:?} at log index {}",
+            common::ReplicationLevel::try_from(err.replication)
+                .unwrap_or(common::ReplicationLevel::Majority),
+            err.log_index
+        )),
+        Some(ExceptionDetails::DataStreamException(err))
+        | Some(ExceptionDetails::LeaderSteppingDownException(err))
+        | Some(ExceptionDetails::TransferLeadershipException(err))
+        | Some(ExceptionDetails::ReadException(err))
+        | Some(ExceptionDetails::ReadIndexException(err)) => {
+            Error::Ratis(format!("{}: {}", err.class_name, err.error_message))
+        }
+        None => Error::Ratis("ratis reply failed without exception details".to_string()),
     }
 }
 
