@@ -7,7 +7,8 @@ use crate::ratis::RatisClient;
 use crate::util::{
     block_id_to_datanode, datanode_uuid_string, key_replication, latest_key_locations,
     no_checksum_data, token_proto_to_url_string, CLIENT_VERSION, DEFAULT_CHUNK_SIZE,
-    DEFAULT_READ_RESPONSE_SIZE,
+    DEFAULT_MAX_WRITE_RETRIES, DEFAULT_READ_RESPONSE_SIZE, DEFAULT_STREAM_FLUSH_SIZE,
+    DEFAULT_STREAM_WINDOW_SIZE,
 };
 use std::collections::{BTreeMap, HashSet};
 
@@ -16,8 +17,13 @@ const FSO_LIST_PAGE_SIZE: u64 = 1024;
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub chunk_size: usize,
+    pub stream_flush_size: usize,
+    pub stream_window_size: usize,
     pub read_response_size: u32,
     pub watch_for_commit: bool,
+    pub max_write_retries: usize,
+    pub enable_put_block_piggybacking: bool,
+    pub enable_incremental_chunk_list: bool,
     pub host_override: Option<String>,
 }
 
@@ -25,8 +31,13 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
+            stream_flush_size: DEFAULT_STREAM_FLUSH_SIZE,
+            stream_window_size: DEFAULT_STREAM_WINDOW_SIZE,
             read_response_size: DEFAULT_READ_RESPONSE_SIZE,
             watch_for_commit: true,
+            max_write_retries: DEFAULT_MAX_WRITE_RETRIES,
+            enable_put_block_piggybacking: true,
+            enable_incremental_chunk_list: true,
             host_override: None,
         }
     }

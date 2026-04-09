@@ -4,6 +4,7 @@ mod error;
 mod om;
 pub mod proto;
 mod ratis;
+mod retry_window;
 mod util;
 
 pub use client::{ClientConfig, OzoneClient};
