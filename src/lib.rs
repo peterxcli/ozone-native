@@ -1,3 +1,4 @@
+mod block_writer;
 mod client;
 mod datanode;
 mod error;
