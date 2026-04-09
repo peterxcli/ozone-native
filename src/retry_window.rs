@@ -65,6 +65,7 @@ impl RetryWindow {
         }
     }
 
+    #[cfg(test)]
     pub fn acknowledged_offset(&self) -> u64 {
         self.acknowledged_offset
     }

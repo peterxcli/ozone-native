@@ -37,6 +37,53 @@ fn test_volume_bucket_key_metadata_and_roundtrip() -> TestResult {
         .expect("integration test thread")
 }
 
+#[test]
+#[ignore = "requires a local docker-compose Ozone cluster"]
+fn test_large_key_write_uses_pipeline_config_and_roundtrips() -> TestResult {
+    std::thread::Builder::new()
+        .name("ozone-pipeline-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let client = OzoneClient::connect_with_config(
+                    &om_endpoint(),
+                    ClientConfig {
+                        host_override: Some("127.0.0.1".to_string()),
+                        chunk_size: 64 * 1024,
+                        stream_flush_size: 256 * 1024,
+                        stream_window_size: 512 * 1024,
+                        ..ClientConfig::default()
+                    },
+                )
+                .await?;
+                let volume = unique_name("vol");
+                let bucket = unique_name("bucket");
+                let key = unique_name("key");
+                let data = vec![0x5a; 2 * 1024 * 1024 + 137];
+
+                client.create_volume(&volume, "ozone", "ozone").await?;
+                client.create_bucket(&volume, &bucket).await?;
+
+                let written = client.put_key_bytes(&volume, &bucket, &key, &data).await?;
+                let roundtrip = client.get_key_bytes(&volume, &bucket, &key).await?;
+
+                assert_eq!(written.data_size, data.len() as u64);
+                assert_eq!(roundtrip, data);
+
+                client.delete_key(&volume, &bucket, &key).await?;
+                client.delete_bucket(&volume, &bucket).await?;
+                client.delete_volume(&volume).await?;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("integration test thread")
+}
+
 async fn test_volume_bucket_key_metadata_and_roundtrip_impl() -> TestResult {
     let client = OzoneClient::connect_with_config(
         &om_endpoint(),

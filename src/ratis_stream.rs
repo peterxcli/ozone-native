@@ -71,6 +71,7 @@ impl PendingReplies {
         rx
     }
 
+    #[cfg(test)]
     pub fn complete_ok(&mut self, call_id: u64, log_index: u64) {
         if let Some(tx) = self.waiters.remove(&call_id) {
             let reply = StreamReply {
