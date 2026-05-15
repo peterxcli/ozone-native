@@ -26,6 +26,13 @@ pub struct KeyReplication {
     pub ec_replication: Option<hdds::EcReplicationConfig>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BlockAllocateExcludeList {
+    pub datanodes: Vec<String>,
+    pub container_ids: Vec<i64>,
+    pub pipeline_ids: Vec<hdds::PipelineId>,
+}
+
 impl OmClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let channel = Channel::from_shared(normalize_endpoint(endpoint))
@@ -380,6 +387,7 @@ impl OmClient {
         data_size: u64,
         client_id: u64,
         replication: &KeyReplication,
+        exclude: Option<&BlockAllocateExcludeList>,
     ) -> Result<ozone::KeyLocation> {
         let mut om = self.request(ozone::Type::AllocateBlock);
         om.allocate_block_request = Some(ozone::AllocateBlockRequest {
@@ -410,7 +418,11 @@ impl OmClient {
                 expected_e_tag: None,
             },
             client_id,
-            exclude_list: None,
+            exclude_list: exclude.map(|exclude| hdds::ExcludeListProto {
+                datanodes: exclude.datanodes.clone(),
+                container_ids: exclude.container_ids.clone(),
+                pipeline_ids: exclude.pipeline_ids.clone(),
+            }),
             key_location: None,
         });
         let response = self.submit(om).await?;

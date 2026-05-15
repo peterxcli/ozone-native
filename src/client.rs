@@ -1,13 +1,12 @@
+use crate::block_writer::BlockWriter;
 use crate::datanode::DatanodeClient;
-use crate::error::{Error, Result};
-use crate::om::{KeyReplication, OmClient};
-use crate::proto::hadoop::hdds::datanode;
+use crate::error::Result;
+use crate::om::{BlockAllocateExcludeList, KeyReplication, OmClient};
 use crate::proto::hadoop::ozone::{self, BasicKeyInfo, BucketLayoutProto};
 use crate::ratis::RatisClient;
 use crate::util::{
-    block_id_to_datanode, datanode_uuid_string, key_replication, latest_key_locations,
-    no_checksum_data, token_proto_to_url_string, CLIENT_VERSION, DEFAULT_CHUNK_SIZE,
-    DEFAULT_READ_RESPONSE_SIZE,
+    key_replication, latest_key_locations, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_WRITE_RETRIES,
+    DEFAULT_READ_RESPONSE_SIZE, DEFAULT_STREAM_FLUSH_SIZE, DEFAULT_STREAM_WINDOW_SIZE,
 };
 use std::collections::{BTreeMap, HashSet};
 
@@ -16,8 +15,13 @@ const FSO_LIST_PAGE_SIZE: u64 = 1024;
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub chunk_size: usize,
+    pub stream_flush_size: usize,
+    pub stream_window_size: usize,
     pub read_response_size: u32,
     pub watch_for_commit: bool,
+    pub max_write_retries: usize,
+    pub enable_put_block_piggybacking: bool,
+    pub enable_incremental_chunk_list: bool,
     pub host_override: Option<String>,
 }
 
@@ -25,8 +29,13 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
+            stream_flush_size: DEFAULT_STREAM_FLUSH_SIZE,
+            stream_window_size: DEFAULT_STREAM_WINDOW_SIZE,
             read_response_size: DEFAULT_READ_RESPONSE_SIZE,
             watch_for_commit: true,
+            max_write_retries: DEFAULT_MAX_WRITE_RETRIES,
+            enable_put_block_piggybacking: true,
+            enable_incremental_chunk_list: true,
             host_override: None,
         }
     }
@@ -150,7 +159,8 @@ impl OzoneClient {
         let mut written = 0usize;
 
         while written < data.len() {
-            if pending.is_empty() {
+            let pending_lengths = pending.iter().map(|location| location.length).collect::<Vec<_>>();
+            if should_allocate_new_block(&pending_lengths, written, data.len()) {
                 pending.push(
                     self.om
                         .allocate_block(
@@ -160,6 +170,7 @@ impl OzoneClient {
                             data.len() as u64,
                             open.id,
                             &replication,
+                            None,
                         )
                         .await?,
                 );
@@ -173,20 +184,39 @@ impl OzoneClient {
             };
             let block_len = capacity.min(data.len() - written);
             let block_data = &data[written..written + block_len];
+            let mut current_location = location;
+            let mut exclude = BlockAllocateExcludeList::default();
+            let mut attempt = 0usize;
 
-            let log_index = self.write_block(&location, block_data).await?;
-            if self.config.watch_for_commit {
-                let pipeline = location
-                    .pipeline
-                    .as_ref()
-                    .ok_or(Error::MissingField("key_location.pipeline"))?;
-                self.ratis.watch(pipeline, log_index).await?;
+            loop {
+                let writer = BlockWriter::new(&self.ratis, &self.config, &current_location).await?;
+                match writer.write_all(block_data).await {
+                    Ok(locations) => {
+                        committed.extend(locations);
+                        break;
+                    }
+                    Err(_err) if attempt < self.config.max_write_retries => {
+                        if let Some(pipeline) = current_location.pipeline.as_ref() {
+                            exclude.pipeline_ids.push(pipeline.id.clone());
+                        }
+                        attempt += 1;
+                        current_location = self
+                            .om
+                            .allocate_block(
+                                volume,
+                                bucket,
+                                key,
+                                data.len() as u64,
+                                open.id,
+                                &replication,
+                                Some(&exclude),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
-
-            let mut committed_location = location.clone();
-            committed_location.offset = 0;
-            committed_location.length = block_len as u64;
-            committed.push(committed_location);
             written += block_len;
         }
 
@@ -209,135 +239,6 @@ impl OzoneClient {
         let key_info = self.om.lookup_key(volume, bucket, key).await?;
         self.datanode.read_key_blocks(&key_info).await
     }
-
-    async fn write_block(&self, location: &ozone::KeyLocation, data: &[u8]) -> Result<u64> {
-        let pipeline = location
-            .pipeline
-            .as_ref()
-            .ok_or(Error::MissingField("key_location.pipeline"))?;
-        let leader =
-            crate::util::leader_node(pipeline).ok_or(Error::MissingField("pipeline leader"))?;
-        let block_id = &location.block_id;
-        let datanode_block_id = block_id_to_datanode(block_id, None)?;
-        let token = location
-            .token
-            .as_ref()
-            .map(token_proto_to_url_string)
-            .transpose()?;
-        let pipeline_id = Some(crate::util::pipeline_uuid(&pipeline.id)?.to_string());
-        let datanode_uuid = datanode_uuid_string(leader)?;
-        let local_id = block_id.container_block_id.local_id;
-
-        let mut chunk_infos = Vec::new();
-        let mut offset = 0usize;
-        let mut last_log_index = None;
-
-        #[allow(deprecated)]
-        while offset < data.len() {
-            let chunk_len = self.config.chunk_size.min(data.len() - offset);
-            let chunk = &data[offset..offset + chunk_len];
-            let chunk_info = datanode::ChunkInfo {
-                chunk_name: format!("{local_id}_chunk_{}", chunk_infos.len()),
-                offset: offset as u64,
-                len: chunk_len as u64,
-                metadata: Vec::new(),
-                checksum_data: no_checksum_data(),
-                stripe_checksum: None,
-            };
-
-            let request = datanode::ContainerCommandRequestProto {
-                cmd_type: datanode::Type::WriteChunk as i32,
-                trace_id: None,
-                container_id: block_id.container_block_id.container_id,
-                datanode_uuid: datanode_uuid.clone(),
-                pipeline_id: pipeline_id.clone(),
-                create_container: None,
-                read_container: None,
-                update_container: None,
-                delete_container: None,
-                list_container: None,
-                close_container: None,
-                put_block: None,
-                get_block: None,
-                delete_block: None,
-                list_block: None,
-                read_chunk: None,
-                write_chunk: Some(datanode::WriteChunkRequestProto {
-                    block_id: datanode_block_id,
-                    chunk_data: Some(chunk_info.clone()),
-                    data: Some(chunk.to_vec()),
-                    block: None,
-                }),
-                delete_chunk: None,
-                list_chunk: None,
-                put_small_file: None,
-                get_small_file: None,
-                get_committed_block_length: None,
-                encoded_token: token.clone(),
-                version: Some(CLIENT_VERSION),
-                finalize_block: None,
-                echo: None,
-                get_container_checksum_info: None,
-                read_block: None,
-            };
-
-            last_log_index = Some(
-                self.ratis
-                    .write_container_command(pipeline, request)
-                    .await?,
-            );
-            chunk_infos.push(chunk_info);
-            offset += chunk_len;
-        }
-
-        #[allow(deprecated)]
-        let put_block = datanode::ContainerCommandRequestProto {
-            cmd_type: datanode::Type::PutBlock as i32,
-            trace_id: None,
-            container_id: block_id.container_block_id.container_id,
-            datanode_uuid,
-            pipeline_id,
-            create_container: None,
-            read_container: None,
-            update_container: None,
-            delete_container: None,
-            list_container: None,
-            close_container: None,
-            put_block: Some(datanode::PutBlockRequestProto {
-                block_data: datanode::BlockData {
-                    block_id: datanode_block_id,
-                    flags: None,
-                    metadata: Vec::new(),
-                    chunks: chunk_infos,
-                    size: Some(data.len() as i64),
-                },
-                eof: Some(true),
-            }),
-            get_block: None,
-            delete_block: None,
-            list_block: None,
-            read_chunk: None,
-            write_chunk: None,
-            delete_chunk: None,
-            list_chunk: None,
-            put_small_file: None,
-            get_small_file: None,
-            get_committed_block_length: None,
-            encoded_token: token,
-            version: Some(CLIENT_VERSION),
-            finalize_block: None,
-            echo: None,
-            get_container_checksum_info: None,
-            read_block: None,
-        };
-
-        let put_block_index = self
-            .ratis
-            .write_container_command(pipeline, put_block)
-            .await?;
-        Ok(last_log_index.map_or(put_block_index, |index| index.max(put_block_index)))
-    }
-
     async fn list_keys_fso(
         &self,
         volume: &str,
@@ -474,6 +375,11 @@ fn should_descend_fso_directory(directory: &str, requested_prefix: &str) -> bool
         || requested_prefix.starts_with(directory)
 }
 
+fn should_allocate_new_block(pending_block_lengths: &[u64], written: usize, total_len: usize) -> bool {
+    let _ = (written, total_len);
+    pending_block_lengths.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +397,15 @@ mod tests {
         assert!(should_descend_fso_directory("dir/sub", "dir"));
         assert!(should_descend_fso_directory("test", "te"));
         assert!(!should_descend_fso_directory("other", "dir/file.txt"));
+    }
+
+    #[test]
+    fn allocates_new_block_when_preallocated_list_is_empty() {
+        assert!(should_allocate_new_block(&[], 1024, 1024));
+    }
+
+    #[test]
+    fn reuses_preallocated_block_when_available() {
+        assert!(!should_allocate_new_block(&[8], 0, 8));
     }
 }
