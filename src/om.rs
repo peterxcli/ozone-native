@@ -11,6 +11,37 @@ pub struct OmClient {
     client_id: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::hadoop::hdds;
+
+    #[test]
+    fn file_key_args_sets_recursive_and_replication_fields() {
+        let args = file_key_args(
+            "vol",
+            "bucket",
+            "dir/file.txt",
+            Some(123),
+            &KeyReplication {
+                replication_type: Some(hdds::ReplicationType::Ratis as i32),
+                factor: Some(hdds::ReplicationFactor::Three as i32),
+                ec_replication: None,
+            },
+            Some(true),
+        );
+
+        assert_eq!(args.volume_name, "vol");
+        assert_eq!(args.bucket_name, "bucket");
+        assert_eq!(args.key_name, "dir/file.txt");
+        assert_eq!(args.data_size, Some(123));
+        assert_eq!(args.r#type, Some(hdds::ReplicationType::Ratis as i32));
+        assert_eq!(args.factor, Some(hdds::ReplicationFactor::Three as i32));
+        assert_eq!(args.recursive, Some(true));
+        assert_eq!(args.sort_datanodes, Some(true));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenKeySession {
     pub id: u64,
@@ -31,6 +62,42 @@ pub struct BlockAllocateExcludeList {
     pub datanodes: Vec<String>,
     pub container_ids: Vec<i64>,
     pub pipeline_ids: Vec<hdds::PipelineId>,
+}
+
+fn file_key_args(
+    volume: &str,
+    bucket: &str,
+    key: &str,
+    data_size: Option<u64>,
+    replication: &KeyReplication,
+    recursive: Option<bool>,
+) -> ozone::KeyArgs {
+    ozone::KeyArgs {
+        volume_name: volume.to_string(),
+        bucket_name: bucket.to_string(),
+        key_name: key.to_string(),
+        data_size,
+        r#type: replication.replication_type,
+        factor: replication.factor,
+        key_locations: Vec::new(),
+        is_multipart_key: None,
+        multipart_upload_id: None,
+        multipart_number: None,
+        metadata: Vec::new(),
+        acls: Vec::new(),
+        modification_time: None,
+        sort_datanodes: Some(true),
+        file_encryption_info: None,
+        latest_version_location: None,
+        recursive,
+        head_op: None,
+        ec_replication_config: replication.ec_replication.clone(),
+        force_update_container_cache_from_scm: None,
+        owner_name: None,
+        tags: Vec::new(),
+        expected_data_generation: None,
+        expected_e_tag: None,
+    }
 }
 
 impl OmClient {
@@ -379,6 +446,52 @@ impl OmClient {
         })
     }
 
+    pub async fn create_file(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        data_size: u64,
+        recursive: bool,
+        overwrite: bool,
+        replication: &KeyReplication,
+    ) -> Result<OpenKeySession> {
+        let mut key_args = file_key_args(
+            volume,
+            bucket,
+            key,
+            Some(data_size),
+            replication,
+            Some(recursive),
+        );
+        if replication.replication_type.is_none() && replication.ec_replication.is_none() {
+            key_args.r#type = None;
+            key_args.factor = None;
+        }
+
+        let mut om = self.request(ozone::Type::CreateFile);
+        om.create_file_request = Some(ozone::CreateFileRequest {
+            key_args,
+            is_recursive: recursive,
+            is_overwrite: overwrite,
+            client_id: None,
+        });
+        let response = self.submit(om).await?;
+        let file_response = response
+            .create_file_response
+            .ok_or(Error::MissingField("create_file_response"))?;
+
+        Ok(OpenKeySession {
+            id: file_response
+                .id
+                .ok_or(Error::MissingField("create_file_response.id"))?,
+            open_version: file_response.open_version,
+            key_info: file_response
+                .key_info
+                .ok_or(Error::MissingField("create_file_response.key_info"))?,
+        })
+    }
+
     pub async fn allocate_block(
         &self,
         volume: &str,
@@ -518,6 +631,104 @@ impl OmClient {
             .lookup_key_response
             .and_then(|r| r.key_info)
             .ok_or(Error::MissingField("lookup_key_response.key_info"))
+    }
+
+    pub async fn lookup_file(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<ozone::KeyInfo> {
+        let mut om = self.request(ozone::Type::LookupFile);
+        om.lookup_file_request = Some(ozone::LookupFileRequest {
+            key_args: file_key_args(volume, bucket, key, None, &KeyReplication::default(), None),
+        });
+        let response = self.submit(om).await?;
+        response
+            .lookup_file_response
+            .and_then(|r| r.key_info)
+            .ok_or(Error::MissingField("lookup_file_response.key_info"))
+    }
+
+    pub async fn get_file_status(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<ozone::OzoneFileStatusProto> {
+        let mut om = self.request(ozone::Type::GetFileStatus);
+        om.get_file_status_request = Some(ozone::GetFileStatusRequest {
+            key_args: file_key_args(volume, bucket, key, None, &KeyReplication::default(), None),
+        });
+        let response = self.submit(om).await?;
+        response
+            .get_file_status_response
+            .map(|r| r.status)
+            .ok_or(Error::MissingField("get_file_status_response.status"))
+    }
+
+    pub async fn list_status(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+        start_key: &str,
+        num_entries: u64,
+    ) -> Result<Vec<ozone::OzoneFileStatusProto>> {
+        let mut om = self.request(ozone::Type::ListStatus);
+        om.list_status_request = Some(ozone::ListStatusRequest {
+            key_args: file_key_args(volume, bucket, key, None, &KeyReplication::default(), None),
+            recursive,
+            start_key: start_key.to_string(),
+            num_entries,
+            allow_partial_prefix: Some(false),
+        });
+        let response = self.submit(om).await?;
+        Ok(response
+            .list_status_response
+            .map(|r| r.statuses)
+            .unwrap_or_default())
+    }
+
+    pub async fn create_directory(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+    ) -> Result<()> {
+        let mut om = self.request(ozone::Type::CreateDirectory);
+        om.create_directory_request = Some(ozone::CreateDirectoryRequest {
+            key_args: file_key_args(
+                volume,
+                bucket,
+                key,
+                None,
+                &KeyReplication::default(),
+                Some(recursive),
+            ),
+        });
+        self.submit(om).await?;
+        Ok(())
+    }
+
+    pub async fn set_times(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        mtime: u64,
+        atime: u64,
+    ) -> Result<()> {
+        let mut om = self.request(ozone::Type::SetTimes);
+        om.set_times_request = Some(ozone::SetTimesRequest {
+            key_args: file_key_args(volume, bucket, key, None, &KeyReplication::default(), None),
+            mtime,
+            atime,
+        });
+        self.submit(om).await?;
+        Ok(())
     }
 
     pub async fn get_key_info(
@@ -698,5 +909,61 @@ impl OmClient {
         });
         self.submit(om).await?;
         Ok(())
+    }
+
+    pub async fn get_acl(&self, obj: ozone::OzoneObj) -> Result<Vec<ozone::OzoneAclInfo>> {
+        let mut om = self.request(ozone::Type::GetAcl);
+        om.get_acl_request = Some(ozone::GetAclRequest { obj });
+        let response = self.submit(om).await?;
+        Ok(response
+            .get_acl_response
+            .map(|response| response.acls)
+            .unwrap_or_default())
+    }
+
+    pub async fn add_acl(&self, obj: ozone::OzoneObj, acl: ozone::OzoneAclInfo) -> Result<bool> {
+        let mut om = self.request(ozone::Type::AddAcl);
+        om.add_acl_request = Some(ozone::AddAclRequest {
+            obj,
+            acl,
+            modification_time: None,
+        });
+        let response = self.submit(om).await?;
+        Ok(response
+            .add_acl_response
+            .map(|response| response.response)
+            .unwrap_or_default())
+    }
+
+    pub async fn remove_acl(&self, obj: ozone::OzoneObj, acl: ozone::OzoneAclInfo) -> Result<bool> {
+        let mut om = self.request(ozone::Type::RemoveAcl);
+        om.remove_acl_request = Some(ozone::RemoveAclRequest {
+            obj,
+            acl,
+            modification_time: None,
+        });
+        let response = self.submit(om).await?;
+        Ok(response
+            .remove_acl_response
+            .map(|response| response.response)
+            .unwrap_or_default())
+    }
+
+    pub async fn set_acl(
+        &self,
+        obj: ozone::OzoneObj,
+        acl: Vec<ozone::OzoneAclInfo>,
+    ) -> Result<bool> {
+        let mut om = self.request(ozone::Type::SetAcl);
+        om.set_acl_request = Some(ozone::SetAclRequest {
+            obj,
+            acl,
+            modification_time: None,
+        });
+        let response = self.submit(om).await?;
+        Ok(response
+            .set_acl_response
+            .map(|response| response.response)
+            .unwrap_or_default())
     }
 }

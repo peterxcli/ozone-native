@@ -227,12 +227,7 @@ impl UnorderedRequestManager {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         let request = self.build_request(call_id, request_type, message);
         let receiver = self.pending.lock().await.insert(call_id);
-        if self
-            .request_tx
-            .send(request)
-            .await
-            .is_err()
-        {
+        if self.request_tx.send(request).await.is_err() {
             self.pending.lock().await.complete(
                 call_id,
                 Err(Error::Ratis(
