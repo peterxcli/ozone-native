@@ -1,17 +1,17 @@
 use std::path::{Path, PathBuf};
 
-const OZONE_PROTO_DIR: &str = "third_party/ozone/hadoop-ozone/interface-client/src/main/proto";
-const HDDS_PROTO_DIR: &str = "third_party/ozone/hadoop-hdds/interface-client/src/main/proto";
-const RATIS_PROTO_DIR: &str = "third_party/ratis/ratis-proto/src/main/proto";
+const OZONE_PROTO_DIR: &str = "ozone/hadoop-ozone/interface-client/src/main/proto";
+const HDDS_PROTO_DIR: &str = "ozone/hadoop-hdds/interface-client/src/main/proto";
+const RATIS_PROTO_DIR: &str = "ratis/ratis-proto/src/main/proto";
 
 const PROTO_DIRS: &[&str] = &[OZONE_PROTO_DIR, HDDS_PROTO_DIR, RATIS_PROTO_DIR];
 const PROTO_FILES: &[&str] = &[
-    "third_party/ozone/hadoop-ozone/interface-client/src/main/proto/OmClientProtocol.proto",
-    "third_party/ozone/hadoop-ozone/interface-client/src/main/proto/Security.proto",
-    "third_party/ozone/hadoop-hdds/interface-client/src/main/proto/hdds.proto",
-    "third_party/ozone/hadoop-hdds/interface-client/src/main/proto/DatanodeClientProtocol.proto",
-    "third_party/ratis/ratis-proto/src/main/proto/Raft.proto",
-    "third_party/ratis/ratis-proto/src/main/proto/Grpc.proto",
+    "ozone/hadoop-ozone/interface-client/src/main/proto/OmClientProtocol.proto",
+    "ozone/hadoop-ozone/interface-client/src/main/proto/Security.proto",
+    "ozone/hadoop-hdds/interface-client/src/main/proto/hdds.proto",
+    "ozone/hadoop-hdds/interface-client/src/main/proto/DatanodeClientProtocol.proto",
+    "ratis/ratis-proto/src/main/proto/Raft.proto",
+    "ratis/ratis-proto/src/main/proto/Grpc.proto",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
