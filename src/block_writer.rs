@@ -96,8 +96,13 @@ impl BlockWriterState {
 
     pub fn record_flush(&mut self, flush_len: u64, log_index: u64) {
         self.flush_len = self.flush_len.max(flush_len);
-        self.pending_flushes
-            .insert(flush_len, PendingFlush { log_index, acked: false });
+        self.pending_flushes.insert(
+            flush_len,
+            PendingFlush {
+                log_index,
+                acked: false,
+            },
+        );
     }
 
     pub fn record_watch_success(&mut self, log_index: u64) {
@@ -179,7 +184,8 @@ impl BlockWriter {
             .map(token_proto_to_url_string)
             .transpose()?;
 
-        let mut state = BlockWriterState::new(config.chunk_size as u64, config.stream_flush_size as u64);
+        let mut state =
+            BlockWriterState::new(config.chunk_size as u64, config.stream_flush_size as u64);
         state.set_window_size(config.stream_window_size as u64);
         state.set_put_block_piggybacking(config.enable_put_block_piggybacking);
 
@@ -638,7 +644,11 @@ impl BlockWriter {
                     .is_some_and(|chunk| chunk.end_offset == flush.flush_len))
         }) {
             let receiver = self
-                .send_put_block(flush.chunk_count, flush.flush_len, flush.flush_len == total_len)
+                .send_put_block(
+                    flush.chunk_count,
+                    flush.flush_len,
+                    flush.flush_len == total_len,
+                )
                 .await?;
             pending.push(PendingOperation {
                 receiver,

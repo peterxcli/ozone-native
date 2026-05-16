@@ -1,9 +1,11 @@
+use crate::acl::{key_obj, AclEntry, AclStatus};
 use crate::block_writer::BlockWriter;
 use crate::datanode::DatanodeClient;
-use crate::error::Result;
-use crate::om::{BlockAllocateExcludeList, KeyReplication, OmClient};
+use crate::error::{Error, Result};
+use crate::om::{BlockAllocateExcludeList, KeyReplication, OmClient, OpenKeySession};
 use crate::proto::hadoop::ozone::{self, BasicKeyInfo, BucketLayoutProto};
 use crate::ratis::RatisClient;
+use crate::status::FileStatus;
 use crate::util::{
     key_replication, latest_key_locations, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_WRITE_RETRIES,
     DEFAULT_READ_RESPONSE_SIZE, DEFAULT_STREAM_FLUSH_SIZE, DEFAULT_STREAM_WINDOW_SIZE,
@@ -147,6 +149,44 @@ impl OzoneClient {
             )
             .await?;
 
+        self.write_open_key_bytes(volume, bucket, key, data, open)
+            .await
+    }
+
+    pub async fn put_file_bytes(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        recursive: bool,
+        overwrite: bool,
+    ) -> Result<ozone::KeyInfo> {
+        let open = self
+            .om
+            .create_file(
+                volume,
+                bucket,
+                key,
+                data.len() as u64,
+                recursive,
+                overwrite,
+                &KeyReplication::default(),
+            )
+            .await?;
+
+        self.write_open_key_bytes(volume, bucket, key, data, open)
+            .await
+    }
+
+    async fn write_open_key_bytes(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        open: OpenKeySession,
+    ) -> Result<ozone::KeyInfo> {
         let (replication_type, factor, ec_replication) = key_replication(&open.key_info);
         let replication = KeyReplication {
             replication_type,
@@ -159,7 +199,10 @@ impl OzoneClient {
         let mut written = 0usize;
 
         while written < data.len() {
-            let pending_lengths = pending.iter().map(|location| location.length).collect::<Vec<_>>();
+            let pending_lengths = pending
+                .iter()
+                .map(|location| location.length)
+                .collect::<Vec<_>>();
             if should_allocate_new_block(&pending_lengths, written, data.len()) {
                 pending.push(
                     self.om
@@ -239,6 +282,151 @@ impl OzoneClient {
         let key_info = self.om.lookup_key(volume, bucket, key).await?;
         self.datanode.read_key_blocks(&key_info).await
     }
+
+    pub async fn get_file_bytes(&self, volume: &str, bucket: &str, key: &str) -> Result<Vec<u8>> {
+        let key_info = self.om.lookup_file(volume, bucket, key).await?;
+        self.datanode.read_key_blocks(&key_info).await
+    }
+
+    pub async fn get_file_status(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<FileStatus> {
+        FileStatus::from_ozone(self.om.get_file_status(volume, bucket, key).await?)
+    }
+
+    pub async fn list_status(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+    ) -> Result<Vec<FileStatus>> {
+        const LIST_STATUS_PAGE_SIZE: u64 = 1024;
+
+        let mut start_key = String::new();
+        let mut statuses = Vec::new();
+        loop {
+            let page = self
+                .om
+                .list_status(
+                    volume,
+                    bucket,
+                    key,
+                    recursive,
+                    &start_key,
+                    LIST_STATUS_PAGE_SIZE,
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+
+            let page_len = page.len();
+            let mut last_key = None;
+            for status in page {
+                if let Some(key_info) = status.key_info.as_ref() {
+                    last_key = Some(key_info.key_name.clone());
+                }
+                statuses.push(FileStatus::from_ozone(status)?);
+            }
+
+            if page_len < LIST_STATUS_PAGE_SIZE as usize {
+                break;
+            }
+            let Some(next_start_key) = last_key else {
+                break;
+            };
+            if next_start_key == start_key {
+                break;
+            }
+            start_key = next_start_key;
+        }
+
+        Ok(statuses)
+    }
+
+    pub async fn create_directory(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+    ) -> Result<()> {
+        self.om
+            .create_directory(volume, bucket, key, recursive)
+            .await
+    }
+
+    pub async fn set_times(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        mtime: u64,
+        atime: u64,
+    ) -> Result<()> {
+        self.om.set_times(volume, bucket, key, mtime, atime).await
+    }
+
+    pub async fn get_acl_status(&self, volume: &str, bucket: &str, key: &str) -> Result<AclStatus> {
+        AclStatus::from_ozone(self.om.get_acl(key_obj(volume, bucket, key)).await?)
+    }
+
+    pub async fn add_acls(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        acl_spec: Vec<AclEntry>,
+    ) -> Result<()> {
+        let obj = key_obj(volume, bucket, key);
+        for acl in acl_spec {
+            if !self.om.add_acl(obj.clone(), acl.to_ozone()).await? {
+                return Err(Error::InvalidState(
+                    "OM returned false for addAcl".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn remove_acls(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        acl_spec: Vec<AclEntry>,
+    ) -> Result<()> {
+        let obj = key_obj(volume, bucket, key);
+        for acl in acl_spec {
+            if !self.om.remove_acl(obj.clone(), acl.to_ozone()).await? {
+                return Err(Error::InvalidState(
+                    "OM returned false for removeAcl".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn set_acls(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        acl_spec: Vec<AclEntry>,
+    ) -> Result<()> {
+        let acls = acl_spec.into_iter().map(|acl| acl.to_ozone()).collect();
+        if !self.om.set_acl(key_obj(volume, bucket, key), acls).await? {
+            return Err(Error::InvalidState(
+                "OM returned false for setAcl".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn list_keys_fso(
         &self,
         volume: &str,
@@ -375,7 +563,11 @@ fn should_descend_fso_directory(directory: &str, requested_prefix: &str) -> bool
         || requested_prefix.starts_with(directory)
 }
 
-fn should_allocate_new_block(pending_block_lengths: &[u64], written: usize, total_len: usize) -> bool {
+fn should_allocate_new_block(
+    pending_block_lengths: &[u64],
+    written: usize,
+    total_len: usize,
+) -> bool {
     let _ = (written, total_len);
     pending_block_lengths.is_empty()
 }

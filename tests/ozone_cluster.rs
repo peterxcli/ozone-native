@@ -1,4 +1,5 @@
-use ozone_rust::{ClientConfig, OzoneClient};
+use bytes::Bytes;
+use ozone_rust::{ClientBuilder, ClientConfig, OzoneClient, WriteOptions};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -77,6 +78,72 @@ fn test_large_key_write_uses_pipeline_config_and_roundtrips() -> TestResult {
                 client.delete_key(&volume, &bucket, &key).await?;
                 client.delete_bucket(&volume, &bucket).await?;
                 client.delete_volume(&volume).await?;
+                Ok(())
+            })
+        })?
+        .join()
+        .expect("integration test thread")
+}
+
+#[test]
+#[ignore = "requires a local docker-compose Ozone cluster"]
+fn test_hdfs_compatible_client_file_roundtrip() -> TestResult {
+    std::thread::Builder::new()
+        .name("ozone-hdfs-api-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let admin = OzoneClient::connect_with_config(
+                    &om_endpoint(),
+                    ClientConfig {
+                        host_override: Some("127.0.0.1".to_string()),
+                        ..ClientConfig::default()
+                    },
+                )
+                .await?;
+                let client = ClientBuilder::new()
+                    .with_url(om_endpoint())
+                    .with_config(vec![("ozone.host.override", "127.0.0.1")])
+                    .build()
+                    .await?;
+                let volume = unique_name("vol");
+                let bucket = unique_name("bucket");
+                let key = format!("{}/file.txt", unique_name("dir"));
+                let data = Bytes::from_static(b"hdfs-compatible-api");
+
+                admin.create_volume(&volume, "ozone", "ozone").await?;
+                admin.create_bucket(&volume, &bucket).await?;
+
+                let mut writer = client
+                    .create(
+                        &volume,
+                        &bucket,
+                        &key,
+                        WriteOptions::default().overwrite(true).create_parent(true),
+                    )
+                    .await?;
+                writer.write(data.clone()).await?;
+                writer.close().await?;
+
+                let mut reader = client.read(&volume, &bucket, &key).await?;
+                let roundtrip = reader.read(data.len()).await?;
+                assert_eq!(roundtrip, data);
+
+                let status = client.get_file_info(&volume, &bucket, &key).await?;
+                assert_eq!(status.key, key);
+                assert_eq!(status.length, data.len());
+                assert!(!status.isdir);
+
+                let listed = client.list_status(&volume, &bucket, "", true).await?;
+                assert!(listed.iter().any(|candidate| candidate.key == key));
+
+                assert!(client.delete(&volume, &bucket, &key, false).await?);
+                admin.delete_bucket(&volume, &bucket).await?;
+                admin.delete_volume(&volume).await?;
                 Ok(())
             })
         })?

@@ -29,6 +29,8 @@ pub enum Error {
     MissingField(&'static str),
     #[error("invalid state: {0}")]
     InvalidState(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
 }

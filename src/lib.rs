@@ -1,13 +1,21 @@
+mod acl;
+mod api;
 mod block_writer;
 mod client;
 mod datanode;
 mod error;
+mod file;
 mod om;
 pub mod proto;
 mod ratis;
 mod ratis_stream;
 mod retry_window;
+mod status;
 mod util;
 
+pub use acl::{AclEntry, AclEntryScope, AclEntryType, AclStatus, FsAction};
+pub use api::{Client, ClientBuilder, IORuntime, WriteOptions};
 pub use client::{ClientConfig, OzoneClient};
 pub use error::{Error, Result};
+pub use file::{FileReader, FileWriter, ListStatusIterator};
+pub use status::{ContentSummary, FileStatus};
