@@ -1,10 +1,10 @@
-[submodule "third_party/ozone"]
-	path = third_party/ozone
+[submodule "ozone"]
+	path = ozone
 	url = https://github.com/apache/ozone.git
 	branch = master
 	shallow = true
-[submodule "third_party/ratis"]
-	path = third_party/ratis
+[submodule "ratis"]
+	path = ratis
 	url = https://github.com/apache/ratis.git
 	branch = master
 	shallow = true
