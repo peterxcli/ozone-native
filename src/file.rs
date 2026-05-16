@@ -3,7 +3,7 @@ use crate::client::OzoneClient;
 use crate::error::Result;
 use crate::status::FileStatus;
 use bytes::{Bytes, BytesMut};
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{self, BoxStream};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -130,6 +130,7 @@ impl FileWriter {
                     &self.data,
                     self.options.create_parent,
                     self.options.overwrite,
+                    self.options.replication,
                 )
                 .await?;
             self.closed = true;
@@ -150,7 +151,8 @@ pub struct ListStatusIterator {
 
 #[derive(Default)]
 struct ListStatusState {
-    loaded: bool,
+    finished: bool,
+    start_key: String,
     statuses: VecDeque<FileStatus>,
 }
 
@@ -173,40 +175,47 @@ impl ListStatusIterator {
     }
 
     pub async fn next(&self) -> Option<Result<FileStatus>> {
-        let mut state = self.state.lock().await;
-        if !state.loaded {
+        loop {
+            let mut state = self.state.lock().await;
+            if let Some(status) = state.statuses.pop_front() {
+                return Some(Ok(status));
+            }
+            if state.finished {
+                return None;
+            }
+
+            let start_key = state.start_key.clone();
             match self
                 .client
-                .list_status(&self.volume, &self.bucket, &self.key, self.recursive)
+                .list_status_page(
+                    &self.volume,
+                    &self.bucket,
+                    &self.key,
+                    self.recursive,
+                    &start_key,
+                )
                 .await
             {
-                Ok(statuses) => {
-                    state.statuses = statuses.into();
-                    state.loaded = true;
+                Ok(page) => {
+                    state.start_key = page.next_start_key.unwrap_or_default();
+                    state.finished = !page.has_more;
+                    state.statuses = page.statuses.into();
+                    if state.finished && state.statuses.is_empty() {
+                        return None;
+                    }
                 }
                 Err(err) => {
-                    state.loaded = true;
+                    state.finished = true;
                     return Some(Err(err));
                 }
             }
         }
-        state.statuses.pop_front().map(Ok)
     }
 
     pub fn into_stream(self) -> BoxStream<'static, Result<FileStatus>> {
-        Box::pin(
-            stream::once(async move {
-                self.client
-                    .list_status(&self.volume, &self.bucket, &self.key, self.recursive)
-                    .await
-            })
-            .flat_map(|result| {
-                stream::iter(match result {
-                    Ok(statuses) => statuses.into_iter().map(Ok).collect::<Vec<_>>(),
-                    Err(err) => vec![Err(err)],
-                })
-            }),
-        )
+        Box::pin(stream::unfold(self, |iterator| async move {
+            iterator.next().await.map(|item| (item, iterator))
+        }))
     }
 }
 

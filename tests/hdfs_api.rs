@@ -24,7 +24,7 @@ fn builder_rejects_unknown_config_keys() {
     let result = ClientBuilder::new()
         .with_url("http://127.0.0.1:9874")
         .with_config(vec![("ozone.unknown", "true")])
-        .build_config_for_tests();
+        .build_config();
 
     assert!(result
         .expect_err("unknown config")

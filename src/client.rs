@@ -3,6 +3,7 @@ use crate::block_writer::BlockWriter;
 use crate::datanode::DatanodeClient;
 use crate::error::{Error, Result};
 use crate::om::{BlockAllocateExcludeList, KeyReplication, OmClient, OpenKeySession};
+use crate::proto::hadoop::hdds;
 use crate::proto::hadoop::ozone::{self, BasicKeyInfo, BucketLayoutProto};
 use crate::ratis::RatisClient;
 use crate::status::FileStatus;
@@ -13,6 +14,14 @@ use crate::util::{
 use std::collections::{BTreeMap, HashSet};
 
 const FSO_LIST_PAGE_SIZE: u64 = 1024;
+pub(crate) const LIST_STATUS_PAGE_SIZE: u64 = 1024;
+
+#[derive(Debug)]
+pub(crate) struct ListStatusPage {
+    pub statuses: Vec<FileStatus>,
+    pub next_start_key: Option<String>,
+    pub has_more: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -161,7 +170,9 @@ impl OzoneClient {
         data: &[u8],
         recursive: bool,
         overwrite: bool,
+        replication_factor: Option<u32>,
     ) -> Result<ozone::KeyInfo> {
+        let replication = replication_from_factor(replication_factor)?;
         let open = self
             .om
             .create_file(
@@ -171,7 +182,7 @@ impl OzoneClient {
                 data.len() as u64,
                 recursive,
                 overwrite,
-                &KeyReplication::default(),
+                &replication,
             )
             .await?;
 
@@ -297,6 +308,10 @@ impl OzoneClient {
         FileStatus::from_ozone(self.om.get_file_status(volume, bucket, key).await?)
     }
 
+    /// Collects every matching status into memory.
+    ///
+    /// The HDFS-compatible [`crate::Client::list_status_iter`] API uses the
+    /// same paginated OM requests without collecting all pages first.
     pub async fn list_status(
         &self,
         volume: &str,
@@ -304,14 +319,11 @@ impl OzoneClient {
         key: &str,
         recursive: bool,
     ) -> Result<Vec<FileStatus>> {
-        const LIST_STATUS_PAGE_SIZE: u64 = 1024;
-
         let mut start_key = String::new();
         let mut statuses = Vec::new();
         loop {
             let page = self
-                .om
-                .list_status(
+                .list_status_page(
                     volume,
                     bucket,
                     key,
@@ -320,32 +332,33 @@ impl OzoneClient {
                     LIST_STATUS_PAGE_SIZE,
                 )
                 .await?;
-            if page.is_empty() {
+            statuses.extend(page.statuses);
+            if !page.has_more {
                 break;
             }
-
-            let page_len = page.len();
-            let mut last_key = None;
-            for status in page {
-                if let Some(key_info) = status.key_info.as_ref() {
-                    last_key = Some(key_info.key_name.clone());
-                }
-                statuses.push(FileStatus::from_ozone(status)?);
-            }
-
-            if page_len < LIST_STATUS_PAGE_SIZE as usize {
-                break;
-            }
-            let Some(next_start_key) = last_key else {
+            let Some(next_start_key) = page.next_start_key else {
                 break;
             };
-            if next_start_key == start_key {
-                break;
-            }
             start_key = next_start_key;
         }
 
         Ok(statuses)
+    }
+
+    pub(crate) async fn list_status_page(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+        start_key: &str,
+        num_entries: u64,
+    ) -> Result<ListStatusPage> {
+        let page = self
+            .om
+            .list_status(volume, bucket, key, recursive, start_key, num_entries)
+            .await?;
+        build_list_status_page(page, start_key, num_entries)
     }
 
     pub async fn create_directory(
@@ -572,9 +585,67 @@ fn should_allocate_new_block(
     pending_block_lengths.is_empty()
 }
 
+fn replication_from_factor(replication: Option<u32>) -> Result<KeyReplication> {
+    let Some(factor) = replication else {
+        return Ok(KeyReplication::default());
+    };
+
+    let factor = match factor {
+        1 => hdds::ReplicationFactor::One,
+        3 => hdds::ReplicationFactor::Three,
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "unsupported replication factor {factor}; Ozone supports 1 or 3"
+            )));
+        }
+    };
+
+    Ok(KeyReplication {
+        replication_type: Some(hdds::ReplicationType::Ratis as i32),
+        factor: Some(factor as i32),
+        ec_replication: None,
+    })
+}
+
+fn build_list_status_page(
+    raw_statuses: Vec<ozone::OzoneFileStatusProto>,
+    start_key: &str,
+    num_entries: u64,
+) -> Result<ListStatusPage> {
+    let raw_len = raw_statuses.len();
+    let mut statuses = Vec::with_capacity(raw_len);
+    let mut next_start_key = None;
+
+    for status in raw_statuses {
+        let status_key = status
+            .key_info
+            .as_ref()
+            .map(|key_info| key_info.key_name.clone());
+        if let Some(key) = &status_key {
+            next_start_key = Some(key.clone());
+        }
+        if !start_key.is_empty() && status_key.as_deref() == Some(start_key) {
+            continue;
+        }
+        statuses.push(FileStatus::from_ozone(status)?);
+    }
+
+    let has_more = raw_len >= num_entries as usize
+        && next_start_key
+            .as_deref()
+            .is_some_and(|next_key| next_key != start_key);
+
+    Ok(ListStatusPage {
+        statuses,
+        next_start_key,
+        has_more,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::hadoop::hdds;
 
     #[test]
     fn matches_fso_prefix_handles_directory_rendering() {
@@ -599,5 +670,108 @@ mod tests {
     #[test]
     fn reuses_preallocated_block_when_available() {
         assert!(!should_allocate_new_block(&[8], 0, 8));
+    }
+
+    #[test]
+    fn maps_write_options_replication_to_ratis_factor() {
+        let replication = replication_from_factor(Some(3)).unwrap();
+
+        assert_eq!(
+            replication.replication_type,
+            Some(hdds::ReplicationType::Ratis as i32)
+        );
+        assert_eq!(
+            replication.factor,
+            Some(hdds::ReplicationFactor::Three as i32)
+        );
+        assert_eq!(replication.ec_replication, None);
+    }
+
+    #[test]
+    fn leaves_default_replication_unset() {
+        let replication = replication_from_factor(None).unwrap();
+
+        assert_eq!(replication.replication_type, None);
+        assert_eq!(replication.factor, None);
+        assert_eq!(replication.ec_replication, None);
+    }
+
+    #[test]
+    fn rejects_unsupported_replication_factor() {
+        let err = replication_from_factor(Some(2)).unwrap_err();
+
+        assert!(err.to_string().contains("unsupported replication factor"));
+    }
+
+    #[test]
+    fn list_status_page_skips_repeated_start_key() {
+        let page = build_list_status_page(
+            vec![ozone_status("dir/a"), ozone_status("dir/b")],
+            "dir/a",
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            page.statuses
+                .iter()
+                .map(|status| status.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir/b"]
+        );
+        assert_eq!(page.next_start_key.as_deref(), Some("dir/b"));
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn list_status_page_marks_short_page_finished() {
+        let page = build_list_status_page(
+            vec![ozone_status("dir/a"), ozone_status("dir/b")],
+            "dir/a",
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(
+            page.statuses
+                .iter()
+                .map(|status| status.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir/b"]
+        );
+        assert_eq!(page.next_start_key.as_deref(), Some("dir/b"));
+        assert!(!page.has_more);
+    }
+
+    fn ozone_status(key: &str) -> ozone::OzoneFileStatusProto {
+        ozone::OzoneFileStatusProto {
+            key_info: Some(ozone::KeyInfo {
+                volume_name: "vol".to_string(),
+                bucket_name: "bucket".to_string(),
+                key_name: key.to_string(),
+                data_size: 0,
+                r#type: hdds::ReplicationType::Ratis as i32,
+                factor: Some(hdds::ReplicationFactor::Three as i32),
+                key_location_list: Vec::new(),
+                creation_time: 0,
+                modification_time: 0,
+                latest_version: None,
+                metadata: Vec::new(),
+                file_encryption_info: None,
+                acls: Vec::new(),
+                object_id: None,
+                update_id: None,
+                parent_id: None,
+                ec_replication_config: None,
+                file_checksum: None,
+                is_file: Some(true),
+                owner_name: None,
+                tags: Vec::new(),
+                expected_data_generation: None,
+                expected_e_tag: None,
+            }),
+            block_size: None,
+            is_directory: Some(false),
+        }
     }
 }

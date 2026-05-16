@@ -1,4 +1,4 @@
-use crate::client::{ClientConfig, OzoneClient};
+use crate::client::{ClientConfig, ListStatusPage, OzoneClient, LIST_STATUS_PAGE_SIZE};
 use crate::error::{Error, Result};
 use crate::file::{FileReader, FileWriter, ListStatusIterator};
 use crate::{AclEntry, AclStatus, ContentSummary, FileStatus};
@@ -29,7 +29,7 @@ pub struct WriteOptions {
     /// Block size accepted for API parity. The current write path uses the
     /// server-provided Ozone block allocation.
     pub block_size: Option<u64>,
-    /// Replication accepted for API parity. The current write path uses the
+    /// Optional RATIS replication factor for file creation. `None` uses the
     /// bucket/server default replication.
     pub replication: Option<u32>,
     /// POSIX permission accepted for API parity. Ozone file create does not
@@ -132,25 +132,13 @@ impl ClientBuilder {
                     .to_string(),
             ));
         }
-        let endpoint = self
-            .url
-            .clone()
-            .or_else(|| {
-                self.config
-                    .as_ref()
-                    .and_then(|values| values.get("fs.defaultFS").cloned())
-            })
-            .ok_or_else(|| {
-                Error::InvalidArgument(
-                    "ClientBuilder requires with_url for the Ozone OM endpoint".to_string(),
-                )
-            })?;
-        let config = self.build_config_for_tests()?;
+        let endpoint = self.resolve_endpoint()?;
+        let config = self.build_config()?;
         let ozone = OzoneClient::connect_with_config(&endpoint, config).await?;
         Ok(Client::from_ozone(ozone))
     }
 
-    pub fn build_config_for_tests(&self) -> Result<ClientConfig> {
+    pub fn build_config(&self) -> Result<ClientConfig> {
         let mut config = ClientConfig::default();
         if let Some(values) = &self.config {
             for (key, value) in values {
@@ -158,6 +146,23 @@ impl ClientBuilder {
             }
         }
         Ok(config)
+    }
+
+    fn resolve_endpoint(&self) -> Result<String> {
+        if let Some(url) = &self.url {
+            return Ok(url.clone());
+        }
+
+        self.config
+            .as_ref()
+            .and_then(|values| values.get("fs.defaultFS"))
+            .map(|value| endpoint_from_default_fs(value))
+            .transpose()?
+            .ok_or_else(|| {
+                Error::InvalidArgument(
+                    "ClientBuilder requires with_url for the Ozone OM endpoint".to_string(),
+                )
+            })
     }
 }
 
@@ -199,6 +204,10 @@ impl Client {
         self.inner.get_file_status(volume, bucket, key).await
     }
 
+    /// Collects every matching status into memory.
+    ///
+    /// Prefer [`Client::list_status_iter`] for large directories so entries are
+    /// fetched and converted a page at a time.
     pub async fn list_status(
         &self,
         volume: &str,
@@ -209,6 +218,27 @@ impl Client {
         self.inner.list_status(volume, bucket, key, recursive).await
     }
 
+    pub(crate) async fn list_status_page(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+        start_key: &str,
+    ) -> Result<ListStatusPage> {
+        self.inner
+            .list_status_page(
+                volume,
+                bucket,
+                key,
+                recursive,
+                start_key,
+                LIST_STATUS_PAGE_SIZE,
+            )
+            .await
+    }
+
+    /// Returns a lazy paginated status iterator.
     pub fn list_status_iter(
         &self,
         volume: &str,
@@ -421,6 +451,60 @@ fn apply_config(config: &mut ClientConfig, key: &str, value: &str) -> Result<()>
     Ok(())
 }
 
+fn endpoint_from_default_fs(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidArgument(
+            "fs.defaultFS must not be empty".to_string(),
+        ));
+    }
+
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return Ok(value.to_string());
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "fs.defaultFS URI `{value}` does not include an authority"
+        )));
+    }
+
+    if scheme.eq_ignore_ascii_case("o3fs") {
+        return Ok(o3fs_om_authority(authority));
+    }
+    Ok(authority.to_string())
+}
+
+fn o3fs_om_authority(authority: &str) -> String {
+    let (host, port) = split_authority_port(authority);
+    if host.starts_with('[') {
+        return authority.to_string();
+    }
+
+    let labels = host.split('.').collect::<Vec<_>>();
+    if labels.len() < 3 {
+        return authority.to_string();
+    }
+    format!("{}{}", labels[2..].join("."), port)
+}
+
+fn split_authority_port(authority: &str) -> (&str, &str) {
+    let Some(index) = authority.rfind(':') else {
+        return (authority, "");
+    };
+    if authority[index + 1..].chars().all(|ch| ch.is_ascii_digit()) {
+        (&authority[..index], &authority[index..])
+    } else {
+        (authority, "")
+    }
+}
+
 fn parse_usize(key: &str, value: &str) -> Result<usize> {
     value
         .parse()
@@ -437,4 +521,46 @@ fn parse_bool(key: &str, value: &str) -> Result<bool> {
     value
         .parse()
         .map_err(|_| Error::InvalidArgument(format!("invalid bool for `{key}`: {value}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_default_fs_o3fs_uri_to_om_endpoint() {
+        let builder = ClientBuilder::new().with_config(vec![(
+            "fs.defaultFS",
+            "o3fs://bucket.volume.om.example.com:9862/path",
+        )]);
+
+        assert_eq!(builder.resolve_endpoint().unwrap(), "om.example.com:9862");
+    }
+
+    #[test]
+    fn resolves_default_fs_ofs_uri_to_authority() {
+        let builder = ClientBuilder::new().with_config(vec![(
+            "fs.defaultFS",
+            "ofs://om.example.com:9862/volume/bucket/key",
+        )]);
+
+        assert_eq!(builder.resolve_endpoint().unwrap(), "om.example.com:9862");
+    }
+
+    #[test]
+    fn leaves_plain_default_fs_endpoint_unchanged() {
+        let builder =
+            ClientBuilder::new().with_config(vec![("fs.defaultFS", "om.example.com:9862")]);
+
+        assert_eq!(builder.resolve_endpoint().unwrap(), "om.example.com:9862");
+    }
+
+    #[test]
+    fn explicit_url_takes_precedence_over_default_fs() {
+        let builder = ClientBuilder::new()
+            .with_url("http://127.0.0.1:9874")
+            .with_config(vec![("fs.defaultFS", "ofs://om.example.com:9862/")]);
+
+        assert_eq!(builder.resolve_endpoint().unwrap(), "http://127.0.0.1:9874");
+    }
 }
