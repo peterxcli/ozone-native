@@ -32,7 +32,6 @@ pub struct ClientConfig {
     pub watch_for_commit: bool,
     pub max_write_retries: usize,
     pub enable_put_block_piggybacking: bool,
-    pub enable_incremental_chunk_list: bool,
     pub host_override: Option<String>,
 }
 
@@ -45,8 +44,7 @@ impl Default for ClientConfig {
             read_response_size: DEFAULT_READ_RESPONSE_SIZE,
             watch_for_commit: true,
             max_write_retries: DEFAULT_MAX_WRITE_RETRIES,
-            enable_put_block_piggybacking: true,
-            enable_incremental_chunk_list: true,
+            enable_put_block_piggybacking: false,
             host_override: None,
         }
     }
@@ -198,6 +196,78 @@ impl OzoneClient {
 
         self.write_open_key_bytes(volume, bucket, key, data, open)
             .await
+    }
+
+    pub(crate) async fn create_file_for_write(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+        overwrite: bool,
+        replication_factor: Option<u32>,
+    ) -> Result<OpenKeySession> {
+        let replication = replication_from_factor(replication_factor)?;
+        self.om
+            .create_file(volume, bucket, key, 0, recursive, overwrite, &replication)
+            .await
+    }
+
+    pub(crate) async fn allocate_file_block_for_write(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        data_size: u64,
+        client_id: u64,
+        replication: &KeyReplication,
+        exclude: Option<&BlockAllocateExcludeList>,
+    ) -> Result<ozone::KeyLocation> {
+        self.om
+            .allocate_block(
+                volume,
+                bucket,
+                key,
+                data_size,
+                client_id,
+                replication,
+                exclude,
+            )
+            .await
+    }
+
+    pub(crate) async fn create_block_writer(
+        &self,
+        location: &ozone::KeyLocation,
+    ) -> Result<BlockWriter> {
+        BlockWriter::new(&self.ratis, &self.config, location).await
+    }
+
+    pub(crate) async fn commit_open_file(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        data_size: u64,
+        client_id: u64,
+        locations: Vec<ozone::KeyLocation>,
+        replication: &KeyReplication,
+    ) -> Result<()> {
+        self.om
+            .commit_key(
+                volume,
+                bucket,
+                key,
+                data_size,
+                client_id,
+                locations,
+                replication,
+            )
+            .await
+    }
+
+    pub(crate) fn max_write_retries(&self) -> usize {
+        self.config.max_write_retries
     }
 
     async fn write_open_key_bytes(
@@ -595,7 +665,7 @@ fn should_allocate_new_block(
     pending_block_lengths.is_empty()
 }
 
-fn replication_from_factor(replication: Option<u32>) -> Result<KeyReplication> {
+pub(crate) fn replication_from_factor(replication: Option<u32>) -> Result<KeyReplication> {
     let Some(factor) = replication else {
         return Ok(KeyReplication::default());
     };
@@ -711,6 +781,13 @@ mod tests {
         let err = replication_from_factor(Some(2)).unwrap_err();
 
         assert!(err.to_string().contains("unsupported replication factor"));
+    }
+
+    #[test]
+    fn defaults_match_ozone_client_write_safety_defaults() {
+        let config = ClientConfig::default();
+
+        assert!(!config.enable_put_block_piggybacking);
     }
 
     #[test]

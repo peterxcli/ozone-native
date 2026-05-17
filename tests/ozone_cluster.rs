@@ -113,7 +113,7 @@ fn test_hdfs_compatible_client_file_roundtrip() -> TestResult {
                 let volume = unique_name("vol");
                 let bucket = unique_name("bucket");
                 let key = format!("{}/file.txt", unique_name("dir"));
-                let data = Bytes::from_static(b"hdfs-compatible-api");
+                let data = Bytes::from_static(b"hdfs-compatible-api-streaming-write");
 
                 admin.create_volume(&volume, "ozone", "ozone").await?;
                 admin.create_bucket(&volume, &bucket).await?;
@@ -126,7 +126,9 @@ fn test_hdfs_compatible_client_file_roundtrip() -> TestResult {
                         WriteOptions::default().overwrite(true).create_parent(true),
                     )
                     .await?;
-                writer.write(data.clone()).await?;
+                writer.write(data.slice(0..5)).await?;
+                writer.write(data.slice(5..17)).await?;
+                writer.write(data.slice(17..)).await?;
                 writer.close().await?;
 
                 let mut reader = client.read(&volume, &bucket, &key).await?;

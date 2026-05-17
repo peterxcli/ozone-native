@@ -26,8 +26,8 @@ impl From<Handle> for IORuntime {
 
 #[derive(Clone, Debug)]
 pub struct WriteOptions {
-    /// Block size accepted for API parity. The current write path uses the
-    /// server-provided Ozone block allocation.
+    /// Client-side target block size for streaming writes when Ozone returns
+    /// zero-length block allocations.
     pub block_size: Option<u64>,
     /// Optional RATIS replication factor for file creation. `None` uses the
     /// bucket/server default replication.
@@ -191,13 +191,14 @@ impl Client {
         key: &str,
         write_options: impl AsRef<WriteOptions>,
     ) -> Result<FileWriter> {
-        Ok(FileWriter::new(
+        FileWriter::create(
             Arc::clone(&self.inner),
             volume.to_string(),
             bucket.to_string(),
             key.to_string(),
             write_options.as_ref().clone(),
-        ))
+        )
+        .await
     }
 
     pub async fn get_file_info(&self, volume: &str, bucket: &str, key: &str) -> Result<FileStatus> {
@@ -439,9 +440,6 @@ fn apply_config(config: &mut ClientConfig, key: &str, value: &str) -> Result<()>
         "ozone.max.write.retries" => config.max_write_retries = parse_usize(key, value)?,
         "ozone.enable.put.block.piggybacking" => {
             config.enable_put_block_piggybacking = parse_bool(key, value)?
-        }
-        "ozone.enable.incremental.chunk.list" => {
-            config.enable_incremental_chunk_list = parse_bool(key, value)?
         }
         "ozone.host.override" => config.host_override = Some(value.to_string()),
         _ => {

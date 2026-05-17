@@ -43,7 +43,6 @@ crate, not that every edge case has production-grade coverage yet.
 - [x] Watch RATIS log indexes for majority commit
 - [x] Configurable chunk, flush, and stream-window sizes
 - [x] Optional `PutBlock` piggybacking on the last chunk in a flush
-- [x] Incremental chunk-list metadata for `PutBlock`
 - [x] Retry unacknowledged write tails
 - [x] Reallocate blocks with an exclude list after write failures
 - [x] RATIS replication factor `ONE` or `THREE` at file creation time
@@ -51,7 +50,8 @@ crate, not that every edge case has production-grade coverage yet.
 - [ ] Checksum generation and validation
 - [ ] Erasure-coded reads and writes
 - [ ] True streaming file reads from the public `FileReader`
-- [ ] True streaming file writes from the public `FileWriter`
+- [x] True streaming file writes from the public `FileWriter`
+- [ ] Pooled block writes
 
 ### HDFS-compatible client surface
 
@@ -82,7 +82,6 @@ crate, not that every edge case has production-grade coverage yet.
 - [x] `ozone.watch.for.commit`
 - [x] `ozone.max.write.retries`
 - [x] `ozone.enable.put.block.piggybacking`
-- [x] `ozone.enable.incremental.chunk.list`
 - [x] `ozone.host.override`
 - [ ] Ozone Manager HA and failover discovery
 - [ ] Kerberos, delegation tokens, and SASL authentication
