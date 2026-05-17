@@ -15,8 +15,6 @@ use crate::util::{
 use prost::Message;
 use std::collections::BTreeMap;
 
-const INCREMENTAL_CHUNK_LIST_KEY: &str = "INCREMENTAL_CHUNK_LIST";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlushAction {
     StandalonePutBlock { flush_len: u64 },
@@ -215,12 +213,26 @@ impl BlockWriter {
     pub fn for_test(chunk_size: u64, flush_size: u64) -> Self {
         let mut state = BlockWriterState::new(chunk_size, flush_size);
         state.set_window_size(flush_size);
+        let config = ClientConfig {
+            chunk_size: chunk_size as usize,
+            stream_flush_size: flush_size as usize,
+            stream_window_size: flush_size as usize,
+            ..ClientConfig::default()
+        };
         Self {
             ratis: RatisClient::default(),
             pipeline: hdds::Pipeline::default(),
             manager: None,
-            target: None,
-            config: ClientConfig::default(),
+            target: Some(BlockTarget {
+                location: ozone::KeyLocation::default(),
+                datanode_block_id: datanode::DatanodeBlockId::default(),
+                container_id: 0,
+                datanode_uuid: String::new(),
+                pipeline_id: None,
+                token: None,
+                local_id: 0,
+            }),
+            config,
             state,
             retry_window: RetryWindow::new(),
             all_chunks: Vec::new(),
@@ -258,6 +270,24 @@ impl BlockWriter {
             return Ok(Vec::new());
         }
 
+        self.write_inner(data, true).await?;
+        Ok(vec![self.committed_location(data.len() as u64)?])
+    }
+
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.write_inner(data, false).await
+    }
+
+    pub async fn close(mut self) -> Result<ozone::KeyLocation> {
+        let written_len = self.state.written_len();
+        if written_len > 0 {
+            self.force_put_block(written_len, true).await?;
+        }
+        self.committed_location(written_len)
+    }
+
+    async fn write_inner(&mut self, data: &[u8], terminal_at_end: bool) -> Result<()> {
+        let terminal_len = terminal_at_end.then(|| self.state.written_len() + data.len() as u64);
         let mut offset = 0usize;
         while offset < data.len() {
             let batch_limit = if self.config.stream_window_size == 0 {
@@ -267,31 +297,34 @@ impl BlockWriter {
             };
             let mut pending = Vec::new();
             let mut resend_unacked = false;
+            let mut resend_error = None;
 
             while offset < batch_limit {
                 let remaining = batch_limit - offset;
                 let chunk_len = self.config.chunk_size.min(remaining);
                 let next_offset = offset + chunk_len;
+                let chunk_start = self.state.written_len();
+                let chunk_end = chunk_start + chunk_len as u64;
                 let chunk_data = data[offset..next_offset].to_vec();
-                let chunk_info = self.build_chunk_info(offset as u64, chunk_len as u64);
+                let chunk_info = self.build_chunk_info(chunk_start, chunk_len as u64);
                 self.state.observe_write(chunk_len as u64);
                 self.retry_window.track_write_chunk(RetryChunk::new(
-                    offset as u64,
-                    next_offset as u64,
+                    chunk_start,
+                    chunk_end,
                     chunk_data.clone(),
                 ));
                 self.all_chunks.push(chunk_info.clone());
 
-                let is_final_chunk = next_offset == data.len();
+                let is_final_chunk = terminal_len == Some(chunk_end);
                 let flush = self
                     .state
                     .flush_action_for(self.state.written_len(), is_final_chunk)
-                    .map(|action| FlushSubmission {
-                        flush_len: match action {
+                    .map(|action| {
+                        let flush_len = match action {
                             FlushAction::StandalonePutBlock { flush_len }
                             | FlushAction::PiggybackLastChunk { flush_len } => flush_len,
-                        },
-                        chunk_count: self.all_chunks.len(),
+                        };
+                        self.flush_submission(flush_len)
                     });
                 offset = next_offset;
 
@@ -308,7 +341,8 @@ impl BlockWriter {
                         .await
                     {
                         Ok(receiver) => receiver,
-                        Err(_) => {
+                        Err(err) => {
+                            resend_error = Some(err);
                             resend_unacked = true;
                             break;
                         }
@@ -323,7 +357,8 @@ impl BlockWriter {
                         .await
                     {
                         Ok(receiver) => receiver,
-                        Err(_) => {
+                        Err(err) => {
+                            resend_error = Some(err);
                             resend_unacked = true;
                             break;
                         }
@@ -339,7 +374,8 @@ impl BlockWriter {
                             .await
                         {
                             Ok(receiver) => receiver,
-                            Err(_) => {
+                            Err(err) => {
+                                resend_error = Some(err);
                                 resend_unacked = true;
                                 break;
                             }
@@ -353,21 +389,45 @@ impl BlockWriter {
             }
 
             if resend_unacked {
-                self.retry_unacked_tail(data.len() as u64).await?;
+                self.retry_unacked_tail(terminal_len, resend_error).await?;
                 continue;
             }
 
-            if let Err(_) = self.await_pending_operations(pending).await {
-                self.retry_unacked_tail(data.len() as u64).await?;
+            if let Err(err) = self.await_pending_operations(pending).await {
+                self.retry_unacked_tail(terminal_len, Some(err)).await?;
                 continue;
             }
 
             if self.state.should_wait_for_window() && self.state.acked_len() == 0 {
-                self.retry_unacked_tail(data.len() as u64).await?;
+                self.retry_unacked_tail(terminal_len, None).await?;
             }
         }
 
-        Ok(vec![self.committed_location(data.len() as u64)?])
+        Ok(())
+    }
+
+    async fn force_put_block(&mut self, flush_len: u64, eof: bool) -> Result<()> {
+        let flush = self.flush_submission(flush_len);
+        self.retry_window.track_put_block(flush.flush_len);
+        let receiver = match self
+            .send_put_block(flush.chunk_count, flush.flush_len, eof)
+            .await
+        {
+            Ok(receiver) => receiver,
+            Err(err) => {
+                self.retry_unacked_tail(Some(flush_len), Some(err)).await?;
+                return Ok(());
+            }
+        };
+        let pending = vec![PendingOperation {
+            receiver,
+            flush: Some(flush),
+        }];
+
+        if let Err(err) = self.await_pending_operations(pending).await {
+            self.retry_unacked_tail(Some(flush_len), Some(err)).await?;
+        }
+        Ok(())
     }
 
     fn build_chunk_info(&mut self, offset: u64, chunk_len: u64) -> datanode::ChunkInfo {
@@ -393,25 +453,19 @@ impl BlockWriter {
         let target = self.target.as_ref().ok_or_else(|| {
             Error::InvalidState("block writer target missing for putBlock".to_string())
         })?;
-
-        let (metadata, chunks) = if self.config.enable_incremental_chunk_list {
-            (
-                vec![datanode::KeyValue {
-                    key: INCREMENTAL_CHUNK_LIST_KEY.to_string(),
-                    value: None,
-                }],
-                self.all_chunks[self.last_acked_chunk_count..chunk_count].to_vec(),
-            )
-        } else {
-            (Vec::new(), self.all_chunks[..chunk_count].to_vec())
-        };
+        if chunk_count > self.all_chunks.len() {
+            return Err(Error::InvalidState(format!(
+                "invalid putBlock chunk count {chunk_count} for {} chunks",
+                self.all_chunks.len()
+            )));
+        }
 
         Ok(datanode::PutBlockRequestProto {
             block_data: datanode::BlockData {
                 block_id: target.datanode_block_id,
                 flags: None,
-                metadata,
-                chunks,
+                metadata: Vec::new(),
+                chunks: self.all_chunks[..chunk_count].to_vec(),
                 size: Some(flush_len as i64),
             },
             eof: Some(eof),
@@ -579,7 +633,13 @@ impl BlockWriter {
         Ok(())
     }
 
-    async fn retry_unacked_tail(&mut self, total_len: u64) -> Result<()> {
+    async fn retry_unacked_tail(
+        &mut self,
+        terminal_len: Option<u64>,
+        initial_error: Option<Error>,
+    ) -> Result<()> {
+        let first_error = initial_error.map(|err| err.to_string());
+        let mut last_error = first_error.clone();
         for _ in 0..=self.config.max_write_retries {
             let plan = self.retry_window.optimize_for_retry();
             if plan.chunks.is_empty() && plan.put_block_offset.is_none() {
@@ -587,18 +647,30 @@ impl BlockWriter {
             }
 
             self.manager = Some(self.ratis.open_unordered_stream(&self.pipeline).await?);
-            match self.replay_plan(plan, total_len).await {
+            match self.replay_plan(plan, terminal_len).await {
                 Ok(()) => return Ok(()),
-                Err(_) => continue,
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    continue;
+                }
             }
         }
 
-        Err(Error::Ratis(
-            "exhausted retry-window resend attempts".to_string(),
-        ))
+        let message = match (first_error, last_error) {
+            (Some(first), Some(last)) if first != last => {
+                format!(
+                    "exhausted retry-window resend attempts; first error: {first}; last error: {last}"
+                )
+            }
+            (_, Some(last)) => {
+                format!("exhausted retry-window resend attempts; last error: {last}")
+            }
+            _ => "exhausted retry-window resend attempts".to_string(),
+        };
+        Err(Error::Ratis(message))
     }
 
-    async fn replay_plan(&mut self, plan: RetryPlan, total_len: u64) -> Result<()> {
+    async fn replay_plan(&mut self, plan: RetryPlan, terminal_len: Option<u64>) -> Result<()> {
         let flush = if let Some(flush_len) = plan.put_block_offset {
             Some(FlushSubmission {
                 flush_len,
@@ -624,7 +696,7 @@ impl BlockWriter {
                             self.build_put_block_request(
                                 flush.chunk_count,
                                 flush.flush_len,
-                                flush.flush_len == total_len,
+                                terminal_len == Some(flush.flush_len),
                             )
                         })
                         .transpose()?,
@@ -647,7 +719,7 @@ impl BlockWriter {
                 .send_put_block(
                     flush.chunk_count,
                     flush.flush_len,
-                    flush.flush_len == total_len,
+                    terminal_len == Some(flush.flush_len),
                 )
                 .await?;
             pending.push(PendingOperation {
@@ -657,6 +729,13 @@ impl BlockWriter {
         }
 
         self.await_pending_operations(pending).await
+    }
+
+    fn flush_submission(&self, flush_len: u64) -> FlushSubmission {
+        FlushSubmission {
+            flush_len,
+            chunk_count: self.all_chunks.len(),
+        }
     }
 
     fn chunk_count_for_offset(&self, flush_len: u64) -> Result<usize> {
@@ -710,6 +789,11 @@ fn ensure_container_success(
 mod tests {
     use super::{BlockWriter, BlockWriterState, FlushAction};
 
+    fn append_chunk(writer: &mut BlockWriter, offset: u64, len: u64) {
+        let chunk = writer.build_chunk_info(offset, len);
+        writer.all_chunks.push(chunk);
+    }
+
     #[test]
     fn flush_boundary_is_created_when_written_minus_flush_reaches_threshold() {
         let mut state = BlockWriterState::new(4, 8);
@@ -762,5 +846,31 @@ mod tests {
         assert_eq!(plan.chunks.len(), 1);
         assert_eq!(plan.chunks[0].start_offset, 4);
         assert_eq!(plan.put_block_offset, Some(8));
+    }
+
+    #[test]
+    fn put_block_lists_all_chunks() {
+        let mut writer = BlockWriter::for_test(4, 8);
+        append_chunk(&mut writer, 0, 4);
+        append_chunk(&mut writer, 4, 4);
+        append_chunk(&mut writer, 8, 4);
+        append_chunk(&mut writer, 12, 4);
+
+        let flush = writer.flush_submission(16);
+        let request = writer
+            .build_put_block_request(flush.chunk_count, flush.flush_len, false)
+            .expect("putBlock");
+
+        assert!(request.block_data.metadata.is_empty());
+        assert_eq!(
+            request
+                .block_data
+                .chunks
+                .iter()
+                .map(|chunk| chunk.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 4, 8, 12]
+        );
+        assert_eq!(request.block_data.size, Some(16));
     }
 }

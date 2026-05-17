@@ -136,17 +136,27 @@ impl UnorderedRequestManager {
             .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
         let (request_tx, request_rx) = mpsc::channel(64);
-        let response = client
-            .unordered(Request::new(ReceiverStream::new(request_rx)))
-            .await?;
-        let mut responses = response.into_inner();
-
         let pending = Arc::new(Mutex::new(PendingReplies::default()));
         let state = Arc::new(Mutex::new(RequestStreamState::Open));
 
         let task_pending = Arc::clone(&pending);
         let task_state = Arc::clone(&state);
         tokio::spawn(async move {
+            let response = client
+                .unordered(Request::new(ReceiverStream::new(request_rx)))
+                .await;
+            let mut responses = match response {
+                Ok(response) => response.into_inner(),
+                Err(status) => {
+                    task_pending
+                        .lock()
+                        .await
+                        .fail_all(&format!("failed to open ratis stream: {status}"));
+                    *task_state.lock().await = RequestStreamState::Closed;
+                    return;
+                }
+            };
+
             loop {
                 match responses.message().await {
                     Ok(Some(reply_proto)) => {
