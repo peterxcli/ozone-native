@@ -106,7 +106,10 @@ public final class JavaOzoneClientBenchmark implements AutoCloseable {
     String line;
     while ((line = stdin.readLine()) != null) {
       String trimmed = line.trim();
-      if (trimmed.isEmpty() || "close".equals(trimmed)) {
+      if (trimmed.isEmpty()) {
+        continue;
+      }
+      if ("close".equals(trimmed)) {
         return;
       }
       String[] parts = trimmed.split("\\s+");
@@ -146,6 +149,7 @@ public final class JavaOzoneClientBenchmark implements AutoCloseable {
       }
     }
     long elapsed = System.nanoTime() - started;
+    // Prevent JIT from optimizing away the blackhole updates.
     if (blackhole == Long.MIN_VALUE) {
       System.err.println("blackhole=" + blackhole);
     }

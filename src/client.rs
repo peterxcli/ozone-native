@@ -137,7 +137,17 @@ impl OzoneClient {
     }
 
     pub async fn delete_key(&self, volume: &str, bucket: &str, key: &str) -> Result<()> {
-        self.om.delete_key(volume, bucket, key).await
+        self.om.delete_key(volume, bucket, key, false).await
+    }
+
+    pub(crate) async fn delete_key_with_recursive(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+    ) -> Result<()> {
+        self.om.delete_key(volume, bucket, key, recursive).await
     }
 
     pub async fn put_key_bytes(

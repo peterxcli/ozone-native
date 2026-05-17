@@ -71,9 +71,15 @@ async fn create_directory(client: &Client, volume: &str, bucket: &str, key: &str
         .expect("create benchmark directory");
 }
 
-async fn cleanup(admin: &OzoneClient, volume: &str, bucket: &str, keys: &[&str]) {
-    for key in keys {
-        let _ = admin.delete_key(volume, bucket, key).await;
+async fn cleanup(
+    admin: &OzoneClient,
+    client: &Client,
+    volume: &str,
+    bucket: &str,
+    directories: &[&str],
+) {
+    for directory in directories {
+        let _ = client.delete(volume, bucket, directory, true).await;
     }
     let _ = admin.delete_bucket(volume, bucket).await;
     let _ = admin.delete_volume(volume).await;
@@ -142,7 +148,7 @@ fn bench(c: &mut Criterion) {
     });
     group.finish();
 
-    rt.block_on(cleanup(&admin, &volume, &bucket, &[key]));
+    rt.block_on(cleanup(&admin, &client, &volume, &bucket, &[key]));
 }
 
 criterion_group!(benches, bench);

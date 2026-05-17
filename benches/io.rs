@@ -69,22 +69,21 @@ async fn build_clients(cluster: &BenchCluster, env: &BenchEnv) -> (OzoneClient, 
     let admin = OzoneClient::connect_with_config(&cluster.endpoint, config)
         .await
         .expect("connect admin client");
-    let mut builder = ClientBuilder::new().with_url(&cluster.endpoint);
+    let builder = ClientBuilder::new().with_url(&cluster.endpoint);
     let watch_for_commit = env.watch_for_commit.to_string();
     let max_write_retries = env.native_max_write_retries.to_string();
+    let mut configs = vec![
+        ("ozone.watch.for.commit", watch_for_commit.as_str()),
+        ("ozone.max.write.retries", max_write_retries.as_str()),
+    ];
     if let Some(host_override) = &cluster.host_override {
-        builder = builder.with_config(vec![
-            ("ozone.host.override", host_override.as_str()),
-            ("ozone.watch.for.commit", watch_for_commit.as_str()),
-            ("ozone.max.write.retries", max_write_retries.as_str()),
-        ]);
-    } else {
-        builder = builder.with_config(vec![
-            ("ozone.watch.for.commit", watch_for_commit.as_str()),
-            ("ozone.max.write.retries", max_write_retries.as_str()),
-        ]);
+        configs.push(("ozone.host.override", host_override.as_str()));
     }
-    let client = builder.build().await.expect("connect compatibility client");
+    let client = builder
+        .with_config(configs)
+        .build()
+        .await
+        .expect("connect compatibility client");
     (admin, client)
 }
 

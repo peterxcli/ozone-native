@@ -267,9 +267,11 @@ impl Client {
         volume: &str,
         bucket: &str,
         key: &str,
-        _recursive: bool,
+        recursive: bool,
     ) -> Result<bool> {
-        self.inner.delete_key(volume, bucket, key).await?;
+        self.inner
+            .delete_key_with_recursive(volume, bucket, key, recursive)
+            .await?;
         Ok(true)
     }
 

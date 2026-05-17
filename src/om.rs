@@ -40,6 +40,16 @@ mod tests {
         assert_eq!(args.recursive, Some(true));
         assert_eq!(args.sort_datanodes, Some(true));
     }
+
+    #[test]
+    fn delete_key_args_sets_recursive_flag() {
+        let args = delete_key_args("vol", "bucket", "dir", true);
+
+        assert_eq!(args.volume_name, "vol");
+        assert_eq!(args.bucket_name, "bucket");
+        assert_eq!(args.key_name, "dir");
+        assert_eq!(args.recursive, Some(true));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +102,35 @@ fn file_key_args(
         recursive,
         head_op: None,
         ec_replication_config: replication.ec_replication.clone(),
+        force_update_container_cache_from_scm: None,
+        owner_name: None,
+        tags: Vec::new(),
+        expected_data_generation: None,
+        expected_e_tag: None,
+    }
+}
+
+fn delete_key_args(volume: &str, bucket: &str, key: &str, recursive: bool) -> ozone::KeyArgs {
+    ozone::KeyArgs {
+        volume_name: volume.to_string(),
+        bucket_name: bucket.to_string(),
+        key_name: key.to_string(),
+        data_size: None,
+        r#type: None,
+        factor: None,
+        key_locations: Vec::new(),
+        is_multipart_key: None,
+        multipart_upload_id: None,
+        multipart_number: None,
+        metadata: Vec::new(),
+        acls: Vec::new(),
+        modification_time: None,
+        sort_datanodes: None,
+        file_encryption_info: None,
+        latest_version_location: None,
+        recursive: Some(recursive),
+        head_op: None,
+        ec_replication_config: None,
         force_update_container_cache_from_scm: None,
         owner_name: None,
         tags: Vec::new(),
@@ -877,35 +916,16 @@ impl OmClient {
             .unwrap_or_default())
     }
 
-    pub async fn delete_key(&self, volume: &str, bucket: &str, key: &str) -> Result<()> {
+    pub async fn delete_key(
+        &self,
+        volume: &str,
+        bucket: &str,
+        key: &str,
+        recursive: bool,
+    ) -> Result<()> {
         let mut om = self.request(ozone::Type::DeleteKey);
         om.delete_key_request = Some(ozone::DeleteKeyRequest {
-            key_args: ozone::KeyArgs {
-                volume_name: volume.to_string(),
-                bucket_name: bucket.to_string(),
-                key_name: key.to_string(),
-                data_size: None,
-                r#type: None,
-                factor: None,
-                key_locations: Vec::new(),
-                is_multipart_key: None,
-                multipart_upload_id: None,
-                multipart_number: None,
-                metadata: Vec::new(),
-                acls: Vec::new(),
-                modification_time: None,
-                sort_datanodes: None,
-                file_encryption_info: None,
-                latest_version_location: None,
-                recursive: None,
-                head_op: None,
-                ec_replication_config: None,
-                force_update_container_cache_from_scm: None,
-                owner_name: None,
-                tags: Vec::new(),
-                expected_data_generation: None,
-                expected_e_tag: None,
-            },
+            key_args: delete_key_args(volume, bucket, key, recursive),
         });
         self.submit(om).await?;
         Ok(())
