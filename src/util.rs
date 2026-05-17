@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 pub const CLIENT_VERSION: u32 = 3;
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_BLOCK_SIZE: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_STREAM_FLUSH_SIZE: usize = 16 * 1024 * 1024;
 pub const DEFAULT_STREAM_WINDOW_SIZE: usize = 32 * 1024 * 1024;
 pub const DEFAULT_READ_RESPONSE_SIZE: u32 = 1024 * 1024;

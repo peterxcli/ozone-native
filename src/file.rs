@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::om::{BlockAllocateExcludeList, KeyReplication, OpenKeySession};
 use crate::proto::hadoop::ozone;
 use crate::status::FileStatus;
-use crate::util::{key_replication, latest_key_locations};
+use crate::util::{key_replication, latest_key_locations, DEFAULT_BLOCK_SIZE};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, BoxStream};
 use std::collections::VecDeque;
@@ -99,6 +99,7 @@ pub struct FileWriter {
     pending: VecDeque<ozone::KeyLocation>,
     active: Option<ActiveBlock>,
     committed: Vec<ozone::KeyLocation>,
+    block_size: u64,
     bytes_written: u64,
     closed: bool,
 }
@@ -117,14 +118,11 @@ impl ActiveBlockProgress {
         }
     }
 
-    fn from_location_len(len: u64) -> Self {
-        if len == 0 {
-            Self {
-                capacity: None,
-                written: 0,
-            }
-        } else {
+    fn from_location_len(len: u64, fallback_capacity: u64) -> Self {
+        if len > 0 {
             Self::bounded(len)
+        } else {
+            Self::bounded(fallback_capacity.max(1))
         }
     }
 
@@ -156,9 +154,9 @@ struct ActiveBlock {
 }
 
 impl ActiveBlock {
-    fn new(location: ozone::KeyLocation, writer: BlockWriter) -> Self {
+    fn new(location: ozone::KeyLocation, writer: BlockWriter, fallback_capacity: u64) -> Self {
         Self {
-            progress: ActiveBlockProgress::from_location_len(location.length),
+            progress: ActiveBlockProgress::from_location_len(location.length, fallback_capacity),
             location,
             writer: Some(writer),
             data: BytesMut::new(),
@@ -196,7 +194,14 @@ impl FileWriter {
                 options.replication,
             )
             .await?;
-        Ok(Self::new(client, volume, bucket, key, open))
+        Ok(Self::new(
+            client,
+            volume,
+            bucket,
+            key,
+            open,
+            effective_block_size(&options),
+        ))
     }
 
     fn new(
@@ -205,6 +210,7 @@ impl FileWriter {
         bucket: String,
         key: String,
         open: OpenKeySession,
+        block_size: u64,
     ) -> Self {
         let (replication_type, factor, ec_replication) = key_replication(&open.key_info);
         let pending = latest_key_locations(&open.key_info).into();
@@ -222,6 +228,7 @@ impl FileWriter {
             pending,
             active: None,
             committed: Vec::new(),
+            block_size,
             bytes_written: 0,
             closed: false,
         }
@@ -296,7 +303,7 @@ impl FileWriter {
             None => self.allocate_block(None).await?,
         };
         let writer = self.client.create_block_writer(&location).await?;
-        self.active = Some(ActiveBlock::new(location, writer));
+        self.active = Some(ActiveBlock::new(location, writer, self.block_size));
         Ok(())
     }
 
@@ -425,11 +432,18 @@ impl FileWriter {
         if !data.is_empty() {
             writer.write(data).await?;
         }
-        let mut active = ActiveBlock::new(location, writer);
+        let mut active = ActiveBlock::new(location, writer, self.block_size);
         active.data.extend_from_slice(data);
         active.observe_write(data.len());
         Ok(active)
     }
+}
+
+fn effective_block_size(options: &WriteOptions) -> u64 {
+    options
+        .block_size
+        .filter(|block_size| *block_size > 0)
+        .unwrap_or(DEFAULT_BLOCK_SIZE)
 }
 
 fn add_location_pipeline_to_exclude(
@@ -599,13 +613,23 @@ mod tests {
     }
 
     #[test]
-    fn active_block_progress_treats_zero_length_locations_as_unbounded() {
-        let mut progress = ActiveBlockProgress::from_location_len(0);
+    fn active_block_progress_caps_zero_length_locations_at_block_size() {
+        let mut progress = ActiveBlockProgress::from_location_len(0, 16);
 
         assert_eq!(progress.next_write_len(16), 16);
         progress.observe_write(16);
 
-        assert!(!progress.is_full());
-        assert_eq!(progress.next_write_len(8), 8);
+        assert!(progress.is_full());
+        assert_eq!(progress.next_write_len(8), 0);
+    }
+
+    #[test]
+    fn active_block_progress_prefers_nonzero_location_len() {
+        let mut progress = ActiveBlockProgress::from_location_len(8, 16);
+
+        assert_eq!(progress.next_write_len(16), 8);
+        progress.observe_write(8);
+
+        assert!(progress.is_full());
     }
 }

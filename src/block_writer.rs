@@ -271,7 +271,7 @@ impl BlockWriter {
         }
 
         self.write_inner(data, true).await?;
-        Ok(vec![self.committed_location(data.len() as u64)?])
+        Ok(vec![self.committed_location(self.committed_written_len())?])
     }
 
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
@@ -611,6 +611,10 @@ impl BlockWriter {
         Ok(location)
     }
 
+    fn committed_written_len(&self) -> u64 {
+        self.state.written_len()
+    }
+
     fn manager(&self) -> Result<&UnorderedRequestManager> {
         self.manager
             .as_ref()
@@ -872,5 +876,14 @@ mod tests {
             vec![0, 4, 8, 12]
         );
         assert_eq!(request.block_data.size, Some(16));
+    }
+
+    #[test]
+    fn committed_written_len_uses_state_written_len() {
+        let mut writer = BlockWriter::for_test(4, 8);
+        writer.state.observe_write(4);
+        writer.state.observe_write(6);
+
+        assert_eq!(writer.committed_written_len(), 10);
     }
 }

@@ -26,8 +26,8 @@ impl From<Handle> for IORuntime {
 
 #[derive(Clone, Debug)]
 pub struct WriteOptions {
-    /// Block size accepted for API parity. The current write path uses the
-    /// server-provided Ozone block allocation.
+    /// Client-side target block size for streaming writes when Ozone returns
+    /// zero-length block allocations.
     pub block_size: Option<u64>,
     /// Optional RATIS replication factor for file creation. `None` uses the
     /// bucket/server default replication.
