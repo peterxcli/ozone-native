@@ -3,10 +3,13 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use ozone_rust::{Client, ClientBuilder, ClientConfig, OzoneClient, WriteOptions};
 use std::env;
 use tokio::runtime::Runtime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 #[path = "common/bench_cluster.rs"]
 mod bench_cluster;
+#[path = "common/bench_tracing.rs"]
+mod bench_tracing;
 #[path = "common/java_bench.rs"]
 mod java_bench;
 
@@ -22,6 +25,7 @@ struct BenchEnv {
     file_mib: usize,
     read_samples: usize,
     write_samples: usize,
+    native_chunk_size: usize,
     watch_for_commit: bool,
     native_max_write_retries: usize,
 }
@@ -32,6 +36,10 @@ impl BenchEnv {
             file_mib: usize_env("OZONE_BENCH_FILE_MIB", DEFAULT_FILE_MIB),
             read_samples: usize_env("OZONE_BENCH_READ_SAMPLES", DEFAULT_READ_SAMPLES),
             write_samples: usize_env("OZONE_BENCH_WRITE_SAMPLES", DEFAULT_WRITE_SAMPLES),
+            native_chunk_size: usize_env(
+                "OZONE_BENCH_NATIVE_CHUNK_SIZE",
+                ClientConfig::default().chunk_size,
+            ),
             watch_for_commit: bool_env("OZONE_BENCH_WATCH_FOR_COMMIT", false),
             native_max_write_retries: usize_env(
                 "OZONE_BENCH_NATIVE_MAX_WRITE_RETRIES",
@@ -62,6 +70,7 @@ fn bool_env(name: &str, default: bool) -> bool {
 async fn build_clients(cluster: &BenchCluster, env: &BenchEnv) -> (OzoneClient, Client) {
     let config = ClientConfig {
         host_override: cluster.host_override.clone(),
+        chunk_size: env.native_chunk_size,
         watch_for_commit: env.watch_for_commit,
         max_write_retries: env.native_max_write_retries,
         ..ClientConfig::default()
@@ -72,7 +81,9 @@ async fn build_clients(cluster: &BenchCluster, env: &BenchEnv) -> (OzoneClient, 
     let builder = ClientBuilder::new().with_url(&cluster.endpoint);
     let watch_for_commit = env.watch_for_commit.to_string();
     let max_write_retries = env.native_max_write_retries.to_string();
+    let native_chunk_size = env.native_chunk_size.to_string();
     let mut configs = vec![
+        ("ozone.chunk.size", native_chunk_size.as_str()),
         ("ozone.watch.for.commit", watch_for_commit.as_str()),
         ("ozone.max.write.retries", max_write_retries.as_str()),
     ];
@@ -141,8 +152,12 @@ fn runtime() -> Runtime {
 
 fn bench(c: &mut Criterion) {
     let env = BenchEnv::from_env();
-    let cluster = BenchCluster::start();
     let rt = runtime();
+    let _tracing = {
+        let _enter = rt.enter();
+        bench_tracing::init("ozone-rust-io-bench")
+    };
+    let cluster = BenchCluster::start();
     let (admin, client) = rt.block_on(build_clients(&cluster, &env));
     let (volume, bucket) = rt.block_on(create_namespace(&admin));
     let read_key = "bench-read";
@@ -170,6 +185,7 @@ fn bench(c: &mut Criterion) {
                 let reader = client.read(&volume, &bucket, read_key).await.unwrap();
                 reader.read_range(0, reader.file_length()).await.unwrap()
             }
+            .instrument(tracing::info_span!("bench.io.read"))
         })
     });
     group.bench_function("read-java", |b| {
@@ -189,6 +205,7 @@ fn bench(c: &mut Criterion) {
             async move {
                 write_file(&client, &volume, &bucket, write_key, data).await;
             }
+            .instrument(tracing::info_span!("bench.io.write"))
         })
     });
     group.bench_function("write-java", |b| {

@@ -3,10 +3,13 @@ use futures::future::join_all;
 use ozone_rust::{Client, ClientBuilder, ClientConfig, OzoneClient};
 use std::env;
 use tokio::runtime::Runtime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 #[path = "common/bench_cluster.rs"]
 mod bench_cluster;
+#[path = "common/bench_tracing.rs"]
+mod bench_tracing;
 #[path = "common/java_bench.rs"]
 mod java_bench;
 
@@ -94,8 +97,12 @@ fn runtime() -> Runtime {
 
 fn bench(c: &mut Criterion) {
     let env = BenchEnv::from_env();
-    let cluster = BenchCluster::start();
     let rt = runtime();
+    let _tracing = {
+        let _enter = rt.enter();
+        bench_tracing::init("ozone-rust-rpc-bench")
+    };
+    let cluster = BenchCluster::start();
     let (admin, client) = rt.block_on(build_clients(&cluster));
     let (volume, bucket) = rt.block_on(create_namespace(&admin));
     let key = "bench-rpc-dir";
@@ -115,6 +122,7 @@ fn bench(c: &mut Criterion) {
                     .await
                     .expect("get benchmark file info")
             }
+            .instrument(tracing::info_span!("bench.rpc.get_file_info"))
         })
     });
     group.bench_function("getFileInfo-java", |b| {
@@ -125,19 +133,35 @@ fn bench(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     group.bench_function("getFileInfo-parallel", |b| {
         b.to_async(&rt).iter_batched(
-            || {
-                (0..parallelism)
-                    .map(|_| {
-                        let client = client.clone();
-                        let volume = volume.clone();
-                        let bucket = bucket.clone();
-                        async move { client.get_file_info(&volume, &bucket, key).await }
-                    })
-                    .collect::<Vec<_>>()
-            },
-            |futures| async {
-                for result in join_all(futures).await {
-                    result.expect("get benchmark file info");
+            || (0..parallelism).collect::<Vec<_>>(),
+            |request_indexes| {
+                let client = client.clone();
+                let volume = volume.clone();
+                let bucket = bucket.clone();
+                async move {
+                    async move {
+                        let requests = request_indexes
+                            .into_iter()
+                            .map(|request_index| {
+                                let client = client.clone();
+                                let volume = volume.clone();
+                                let bucket = bucket.clone();
+                                async move { client.get_file_info(&volume, &bucket, key).await }
+                                    .instrument(tracing::info_span!(
+                                        "bench.rpc.get_file_info_parallel",
+                                        request_index
+                                    ))
+                            })
+                            .collect::<Vec<_>>();
+                        for result in join_all(requests).await {
+                            result.expect("get benchmark file info");
+                        }
+                    }
+                    .instrument(tracing::info_span!(
+                        "bench.rpc.get_file_info_parallel_batch",
+                        parallelism
+                    ))
+                    .await;
                 }
             },
             BatchSize::SmallInput,

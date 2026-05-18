@@ -154,7 +154,13 @@ Optional tuning variables:
 - `OZONE_BENCH_FILE_MIB`: file size for I/O benchmarks, default `128`.
 - `OZONE_BENCH_READ_SAMPLES`: Criterion sample count for reads, default `50`.
 - `OZONE_BENCH_WRITE_SAMPLES`: Criterion sample count for writes, default `10`.
+- `OZONE_BENCH_NATIVE_CHUNK_SIZE`: Rust client write chunk size in bytes, default `1048576`.
 - `OZONE_BENCH_WATCH_FOR_COMMIT`: set to `1` to enable RATIS commit-watch during I/O benchmark writes. The benchmark default is `0`.
 - `OZONE_BENCH_NATIVE_MAX_WRITE_RETRIES`: retry budget for native Rust benchmark setup and write samples, default `50`.
 - `OZONE_BENCH_JAVA_STREAM_READBLOCK_ENABLE`: set to `0` to disable the Java Ozone client's stream read-block API. The benchmark default is `1`.
 - `OZONE_BENCH_RPC_PARALLELISM`: concurrent `get_file_info` calls in the parallel RPC benchmark, default `100`.
+- `OZONE_BENCH_OTEL`: set to `1` to export Rust client benchmark spans through OTLP/gRPC and enable tracing in the benchmark MiniOzoneCluster. Set `OTEL_EXPORTER_OTLP_ENDPOINT` as needed; Ozone defaults to `http://localhost:4317`. Benchmark tracing uses a large queued batch exporter for complete Jaeger waterfalls; leave this off for throughput measurements.
+- `OTEL_BSP_MAX_QUEUE_SIZE`: Rust benchmark span queue size when `OZONE_BENCH_OTEL=1`, default `131072`.
+- `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`: Rust benchmark OTLP export batch size, default `4096`.
+- `OTEL_BSP_SCHEDULE_DELAY`: Rust benchmark OTLP export interval in milliseconds, default `200`.
+- `OZONE_BENCH_OTEL_TARGETS`: optional Rust `tracing-subscriber` target filter for benchmark spans, default `ozone_rust=info,io=info,rpc=info`.
