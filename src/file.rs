@@ -167,7 +167,12 @@ impl FileWriter {
         let mut offset = 0usize;
         while offset < len {
             self.ensure_current_block().await?;
-            self.ensure_lookahead().await?;
+            if let Err(err) = self.ensure_lookahead().await {
+                tracing::warn!(
+                    error = %err,
+                    "failed to preallocate lookahead block; continuing with current block"
+                );
+            }
             let write_len = self
                 .pool
                 .current_block()

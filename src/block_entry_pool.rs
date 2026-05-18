@@ -124,11 +124,14 @@ impl WritableBlock {
             return Ok(());
         }
 
-        let writer = self
-            .writer
-            .take()
-            .ok_or_else(|| Error::InvalidState("active block writer missing".to_string()))?;
-        let location = writer.close().await?;
+        let location = {
+            let writer = self
+                .writer
+                .as_mut()
+                .ok_or_else(|| Error::InvalidState("active block writer missing".to_string()))?;
+            writer.close().await?
+        };
+        self.writer = None;
         self.update_committed_location(location);
         Ok(())
     }
@@ -143,9 +146,7 @@ impl WritableBlock {
         if self.is_empty() || !self.closed {
             None
         } else {
-            let mut location = self.location.clone();
-            location.length = self.progress.written;
-            Some(location)
+            Some(self.location.clone())
         }
     }
 }
@@ -220,6 +221,7 @@ impl BlockEntryPool {
 #[cfg(test)]
 mod tests {
     use super::{ActiveBlockProgress, BlockEntryPool, WritableBlock};
+    use crate::block_writer::BlockWriter;
     use crate::proto::hadoop::{hdds, ozone};
 
     fn location(local_id: i64, len: u64) -> ozone::KeyLocation {
@@ -280,6 +282,20 @@ mod tests {
 
         block.close().await.unwrap();
 
+        assert!(block.committed_location().is_none());
+    }
+
+    #[tokio::test]
+    async fn writable_block_keeps_writer_when_close_fails() {
+        let mut block = WritableBlock::new(location(1, 8), 8);
+        let mut writer = BlockWriter::for_test(4, 8);
+        assert!(writer.write(b"test").await.is_err());
+        block.attach_writer(writer).unwrap();
+        block.observe_write(4);
+
+        assert!(block.close().await.is_err());
+
+        assert!(!block.needs_writer());
         assert!(block.committed_location().is_none());
     }
 
