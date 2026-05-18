@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Request;
+use tracing::Instrument;
 use uuid::Uuid;
 
 pub type PendingReply = oneshot::Receiver<Result<StreamReply>>;
@@ -126,11 +127,24 @@ impl UnorderedRequestManager {
         host_override: Option<String>,
     ) -> Result<Self> {
         let leader = leader_node(pipeline).ok_or(Error::MissingField("pipeline leader"))?;
+        let leader_id = datanode_uuid_string(leader)?;
+        let group_id = pipeline_uuid(&pipeline.id)?;
         let address = datanode_ratis_client_address(leader, host_override.as_deref())?;
-        let channel = Channel::from_shared(normalize_endpoint(&address))
-            .map_err(|e| Error::InvalidState(format!("invalid ratis endpoint: {e}")))?
-            .connect()
-            .await?;
+        let span = tracing::info_span!(
+            "ozone.ratis.open_unordered_stream",
+            address = %address,
+            leader_id = %leader_id,
+            group_id = %group_id
+        );
+        let channel = async {
+            Channel::from_shared(normalize_endpoint(&address))
+                .map_err(|e| Error::InvalidState(format!("invalid ratis endpoint: {e}")))?
+                .connect()
+                .await
+                .map_err(Error::from)
+        }
+        .instrument(span)
+        .await?;
         let mut client = RaftClientProtocolServiceClient::new(channel)
             .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
@@ -141,67 +155,75 @@ impl UnorderedRequestManager {
 
         let task_pending = Arc::clone(&pending);
         let task_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let response = client
-                .unordered(Request::new(ReceiverStream::new(request_rx)))
-                .await;
-            let mut responses = match response {
-                Ok(response) => response.into_inner(),
-                Err(status) => {
-                    task_pending
-                        .lock()
-                        .await
-                        .fail_all(&format!("failed to open ratis stream: {status}"));
-                    *task_state.lock().await = RequestStreamState::Closed;
-                    return;
-                }
-            };
-
-            loop {
-                match responses.message().await {
-                    Ok(Some(reply_proto)) => {
-                        let result = StreamReply::from_proto(reply_proto);
-                        match result {
-                            Ok((call_id, reply)) => {
-                                let success = reply
-                                    .proto
-                                    .rpc_reply
-                                    .as_ref()
-                                    .map(|rpc| rpc.success)
-                                    .unwrap_or(false);
-                                if success {
-                                    task_pending.lock().await.complete(call_id, Ok(reply));
-                                } else {
-                                    let err = ratis_reply_error(&reply.proto);
-                                    task_pending.lock().await.complete(call_id, Err(err));
-                                }
-                            }
-                            Err(err) => {
-                                task_pending
-                                    .lock()
-                                    .await
-                                    .fail_all(&format!("invalid ratis reply: {err}"));
-                                *task_state.lock().await = RequestStreamState::Closed;
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        task_pending.lock().await.fail_all("ratis stream closed");
-                        *task_state.lock().await = RequestStreamState::Closed;
-                        break;
-                    }
+        let stream_span = tracing::info_span!(
+            "ozone.ratis.unordered_response_stream",
+            leader_id = %leader_id,
+            group_id = %group_id
+        );
+        tokio::spawn(
+            async move {
+                let response = client
+                    .unordered(Request::new(ReceiverStream::new(request_rx)))
+                    .await;
+                let mut responses = match response {
+                    Ok(response) => response.into_inner(),
                     Err(status) => {
                         task_pending
                             .lock()
                             .await
-                            .fail_all(&format!("ratis stream error: {status}"));
+                            .fail_all(&format!("failed to open ratis stream: {status}"));
                         *task_state.lock().await = RequestStreamState::Closed;
-                        break;
+                        return;
+                    }
+                };
+
+                loop {
+                    match responses.message().await {
+                        Ok(Some(reply_proto)) => {
+                            let result = StreamReply::from_proto(reply_proto);
+                            match result {
+                                Ok((call_id, reply)) => {
+                                    let success = reply
+                                        .proto
+                                        .rpc_reply
+                                        .as_ref()
+                                        .map(|rpc| rpc.success)
+                                        .unwrap_or(false);
+                                    if success {
+                                        task_pending.lock().await.complete(call_id, Ok(reply));
+                                    } else {
+                                        let err = ratis_reply_error(&reply.proto);
+                                        task_pending.lock().await.complete(call_id, Err(err));
+                                    }
+                                }
+                                Err(err) => {
+                                    task_pending
+                                        .lock()
+                                        .await
+                                        .fail_all(&format!("invalid ratis reply: {err}"));
+                                    *task_state.lock().await = RequestStreamState::Closed;
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            task_pending.lock().await.fail_all("ratis stream closed");
+                            *task_state.lock().await = RequestStreamState::Closed;
+                            break;
+                        }
+                        Err(status) => {
+                            task_pending
+                                .lock()
+                                .await
+                                .fail_all(&format!("ratis stream error: {status}"));
+                            *task_state.lock().await = RequestStreamState::Closed;
+                            break;
+                        }
                     }
                 }
             }
-        });
+            .instrument(stream_span),
+        );
 
         Ok(Self {
             request_tx,
@@ -209,8 +231,8 @@ impl UnorderedRequestManager {
             state,
             client_id,
             next_call_id,
-            group_id: pipeline_uuid(&pipeline.id)?,
-            leader_id: datanode_uuid_string(leader)?,
+            group_id,
+            leader_id,
         })
     }
 

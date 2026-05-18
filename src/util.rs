@@ -2,7 +2,9 @@ use crate::error::{Error, Result};
 use crate::proto::hadoop::hdds::datanode;
 use crate::proto::hadoop::{common, hdds, ozone};
 use bytes::{BufMut, Bytes, BytesMut};
+use opentelemetry::trace::{TraceContextExt, TraceFlags};
 use prost::Message;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 pub const CLIENT_VERSION: u32 = 3;
@@ -22,8 +24,27 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
     }
 }
 
-pub fn new_trace_id() -> String {
-    Uuid::new_v4().to_string()
+pub fn current_ozone_trace_id() -> Option<String> {
+    let context = tracing::Span::current().context();
+    let span = context.span();
+    let span_context = span.span_context();
+    if !span_context.is_valid() {
+        return None;
+    }
+
+    let mut trace_id = format!(
+        "traceparent=00-{}-{}-{:02x};",
+        span_context.trace_id(),
+        span_context.span_id(),
+        span_context.trace_flags() & TraceFlags::SAMPLED
+    );
+    let trace_state = span_context.trace_state().header();
+    if !trace_state.is_empty() {
+        trace_id.push_str("tracestate=");
+        trace_id.push_str(&trace_state);
+        trace_id.push(';');
+    }
+    Some(trace_id)
 }
 
 pub fn uuid_to_bytes(uuid: Uuid) -> Vec<u8> {
@@ -222,7 +243,33 @@ pub fn token_proto_to_url_string(_token: &common::TokenProto) -> Result<String> 
 mod tests {
     use super::*;
     use crate::proto::hadoop::{hdds, hdds::datanode, ozone};
+    use opentelemetry::trace::TracerProvider as _;
     use prost::Message;
+    use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn current_ozone_trace_id_exports_w3c_traceparent_for_active_span() {
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("ozone-rust-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("client-write");
+            let _guard = span.enter();
+            let trace_id = current_ozone_trace_id().expect("active trace id");
+
+            assert!(trace_id.starts_with("traceparent=00-"));
+            assert!(trace_id.ends_with(';'));
+        });
+
+        provider.shutdown().expect("shutdown tracer provider");
+    }
+
+    #[test]
+    fn current_ozone_trace_id_is_none_without_valid_span() {
+        assert_eq!(current_ozone_trace_id(), None);
+    }
 
     #[test]
     #[allow(deprecated)]

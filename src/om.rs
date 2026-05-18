@@ -1,8 +1,11 @@
 use crate::error::{Error, Result};
 use crate::proto::hadoop::ozone::ozone_manager_service_client::OzoneManagerServiceClient;
 use crate::proto::hadoop::{hdds, ozone};
-use crate::util::{new_trace_id, normalize_endpoint, CLIENT_VERSION, MAX_GRPC_MESSAGE_SIZE};
+use crate::util::{
+    current_ozone_trace_id, normalize_endpoint, CLIENT_VERSION, MAX_GRPC_MESSAGE_SIZE,
+};
 use tonic::transport::Channel;
+use tracing::Instrument;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -15,6 +18,18 @@ pub struct OmClient {
 mod tests {
     use super::*;
     use crate::proto::hadoop::hdds;
+
+    #[tokio::test]
+    async fn om_request_leaves_trace_id_for_submit() {
+        let client = OmClient {
+            channel: Channel::from_static("http://127.0.0.1:9876").connect_lazy(),
+            client_id: "client-1".to_string(),
+        };
+
+        let request = client.request(ozone::Type::GetFileStatus);
+
+        assert!(request.trace_id.is_none());
+    }
 
     #[test]
     fn file_key_args_sets_recursive_and_replication_fields() {
@@ -156,7 +171,7 @@ impl OmClient {
     fn request(&self, cmd_type: ozone::Type) -> Box<ozone::OmRequest> {
         Box::new(ozone::OmRequest {
             cmd_type: cmd_type as i32,
-            trace_id: Some(new_trace_id()),
+            trace_id: None,
             client_id: self.client_id.clone(),
             user_info: None,
             version: Some(CLIENT_VERSION),
@@ -264,13 +279,23 @@ impl OmClient {
         })
     }
 
-    async fn submit(&self, request: Box<ozone::OmRequest>) -> Result<ozone::OmResponse> {
-        let mut client = OzoneManagerServiceClient::new(self.channel.clone())
-            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+    async fn submit(&self, mut request: Box<ozone::OmRequest>) -> Result<ozone::OmResponse> {
+        let cmd_type = ozone::Type::try_from(request.cmd_type)
+            .map(|cmd_type| format!("{cmd_type:?}"))
+            .unwrap_or_else(|_| request.cmd_type.to_string());
+        let span = tracing::info_span!("ozone.om.request", cmd_type = %cmd_type);
 
-        let response = client.submit_request(*request).await?.into_inner();
-        self.ensure_success(response)
+        async {
+            request.trace_id = current_ozone_trace_id();
+            let mut client = OzoneManagerServiceClient::new(self.channel.clone())
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+
+            let response = client.submit_request(*request).await?.into_inner();
+            self.ensure_success(response)
+        }
+        .instrument(span)
+        .await
     }
 
     fn ensure_success(&self, response: ozone::OmResponse) -> Result<ozone::OmResponse> {

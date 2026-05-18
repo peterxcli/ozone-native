@@ -15,6 +15,7 @@ import org.apache.hadoop.hdds.client.RatisReplicationConfig;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor;
+import org.apache.hadoop.hdds.tracing.TracingUtil;
 import org.apache.hadoop.ozone.client.ObjectStore;
 import org.apache.hadoop.ozone.client.OzoneBucket;
 import org.apache.hadoop.ozone.client.OzoneClient;
@@ -54,6 +55,8 @@ public final class JavaOzoneClientBenchmark implements AutoCloseable {
     OzoneConfiguration conf = new OzoneConfiguration();
     conf.setBoolean("hdds.block.token.enabled", false);
     conf.set("ozone.server.default.replication", Integer.toString(replication));
+    conf.setBoolean("ozone.tracing.enabled", booleanEnv("OZONE_BENCH_OTEL",
+        false));
     conf.setBoolean(STREAM_READ_BLOCK_KEY, booleanEnv(STREAM_READ_BLOCK_ENV,
         true));
 
@@ -136,13 +139,17 @@ public final class JavaOzoneClientBenchmark implements AutoCloseable {
     long started = System.nanoTime();
     for (long i = 0; i < iterations; i++) {
       if ("read".equals(operation)) {
-        blackhole += readFile();
+        blackhole += TracingUtil.executeInNewSpan("java.bench.read",
+            this::readFile);
       } else if ("write".equals(operation)) {
-        writeFile(WRITE_KEY);
+        TracingUtil.executeInNewSpan("java.bench.write",
+            () -> writeFile(WRITE_KEY));
       } else if ("getFileStatus".equals(operation)) {
-        blackhole += bucket.getFileStatus(RPC_KEY).isDirectory() ? 1 : 2;
+        blackhole += TracingUtil.executeInNewSpan("java.bench.getFileStatus",
+            () -> bucket.getFileStatus(RPC_KEY).isDirectory() ? 1L : 2L);
       } else if ("getFileStatusParallel".equals(operation)) {
-        blackhole += getFileStatusParallel();
+        blackhole += TracingUtil.executeInNewSpan(
+            "java.bench.getFileStatusParallel", this::getFileStatusParallel);
       } else {
         throw new IllegalArgumentException("unsupported operation: "
             + operation);

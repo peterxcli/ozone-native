@@ -9,11 +9,13 @@ use crate::ratis::RatisClient;
 use crate::ratis_stream::{PendingReply, UnorderedRequestManager};
 use crate::retry_window::{RetryChunk, RetryPlan, RetryWindow};
 use crate::util::{
-    block_id_to_datanode, datanode_uuid_string, encode_container_command_message, leader_node,
-    no_checksum_data, pipeline_uuid, token_proto_to_url_string, CLIENT_VERSION,
+    block_id_to_datanode, current_ozone_trace_id, datanode_uuid_string,
+    encode_container_command_message, leader_node, no_checksum_data, pipeline_uuid,
+    token_proto_to_url_string, CLIENT_VERSION,
 };
 use prost::Message;
 use std::collections::BTreeMap;
+use tracing::Instrument;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlushAction {
@@ -290,87 +292,68 @@ impl BlockWriter {
         let terminal_len = terminal_at_end.then(|| self.state.written_len() + data.len() as u64);
         let mut offset = 0usize;
         while offset < data.len() {
-            let batch_limit = if self.config.stream_window_size == 0 {
-                data.len()
-            } else {
-                (offset + self.config.stream_window_size).min(data.len())
-            };
-            let mut pending = Vec::new();
-            let mut resend_unacked = false;
-            let mut resend_error = None;
+            let window_data_offset = offset;
+            let window_block_offset = self.state.written_len();
+            let batch_limit =
+                write_window_limit(offset, data.len(), self.config.stream_window_size);
+            let window_len = batch_limit - window_data_offset;
+            let chunk_size = self.config.chunk_size;
+            let flush_size = self.config.stream_flush_size;
+            let stream_window_size = self.config.stream_window_size;
+            let span = tracing::info_span!(
+                "ozone.ratis.write_window",
+                data_offset = window_data_offset,
+                block_offset = window_block_offset,
+                len = window_len,
+                chunk_size,
+                flush_size,
+                stream_window_size
+            );
 
-            while offset < batch_limit {
-                let remaining = batch_limit - offset;
-                let chunk_len = self.config.chunk_size.min(remaining);
-                let next_offset = offset + chunk_len;
-                let chunk_start = self.state.written_len();
-                let chunk_end = chunk_start + chunk_len as u64;
-                let chunk_data = data[offset..next_offset].to_vec();
-                let chunk_info = self.build_chunk_info(chunk_start, chunk_len as u64);
-                self.state.observe_write(chunk_len as u64);
-                self.retry_window.track_write_chunk(RetryChunk::new(
-                    chunk_start,
-                    chunk_end,
-                    chunk_data.clone(),
-                ));
-                self.all_chunks.push(chunk_info.clone());
+            async {
+                let mut pending = Vec::new();
+                let mut resend_unacked = false;
+                let mut resend_error = None;
 
-                let is_final_chunk = terminal_len == Some(chunk_end);
-                let flush = self
-                    .state
-                    .flush_action_for(self.state.written_len(), is_final_chunk)
-                    .map(|action| {
-                        let flush_len = match action {
-                            FlushAction::StandalonePutBlock { flush_len }
-                            | FlushAction::PiggybackLastChunk { flush_len } => flush_len,
-                        };
-                        self.flush_submission(flush_len)
-                    });
-                offset = next_offset;
+                while offset < batch_limit {
+                    let remaining = batch_limit - offset;
+                    let chunk_len = self.config.chunk_size.min(remaining);
+                    let next_offset = offset + chunk_len;
+                    let chunk_start = self.state.written_len();
+                    let chunk_end = chunk_start + chunk_len as u64;
+                    let chunk_data = data[offset..next_offset].to_vec();
+                    let chunk_info = self.build_chunk_info(chunk_start, chunk_len as u64);
+                    self.state.observe_write(chunk_len as u64);
+                    self.retry_window.track_write_chunk(RetryChunk::new(
+                        chunk_start,
+                        chunk_end,
+                        chunk_data.clone(),
+                    ));
+                    self.all_chunks.push(chunk_info.clone());
 
-                if self.config.enable_put_block_piggybacking && flush.is_some() {
-                    let flush = flush.expect("flush");
-                    self.retry_window.track_put_block(flush.flush_len);
-                    let put_block = self.build_put_block_request(
-                        flush.chunk_count,
-                        flush.flush_len,
-                        is_final_chunk,
-                    )?;
-                    let receiver = match self
-                        .send_write_chunk(chunk_info.clone(), chunk_data, Some(put_block))
-                        .await
-                    {
-                        Ok(receiver) => receiver,
-                        Err(err) => {
-                            resend_error = Some(err);
-                            resend_unacked = true;
-                            break;
-                        }
-                    };
-                    pending.push(PendingOperation {
-                        receiver,
-                        flush: Some(flush),
-                    });
-                } else {
-                    let receiver = match self
-                        .send_write_chunk(chunk_info.clone(), chunk_data, None)
-                        .await
-                    {
-                        Ok(receiver) => receiver,
-                        Err(err) => {
-                            resend_error = Some(err);
-                            resend_unacked = true;
-                            break;
-                        }
-                    };
-                    pending.push(PendingOperation {
-                        receiver,
-                        flush: None,
-                    });
-                    if let Some(flush) = flush {
+                    let is_final_chunk = terminal_len == Some(chunk_end);
+                    let flush = self
+                        .state
+                        .flush_action_for(self.state.written_len(), is_final_chunk)
+                        .map(|action| {
+                            let flush_len = match action {
+                                FlushAction::StandalonePutBlock { flush_len }
+                                | FlushAction::PiggybackLastChunk { flush_len } => flush_len,
+                            };
+                            self.flush_submission(flush_len)
+                        });
+                    offset = next_offset;
+
+                    if self.config.enable_put_block_piggybacking && flush.is_some() {
+                        let flush = flush.expect("flush");
                         self.retry_window.track_put_block(flush.flush_len);
+                        let put_block = self.build_put_block_request(
+                            flush.chunk_count,
+                            flush.flush_len,
+                            is_final_chunk,
+                        )?;
                         let receiver = match self
-                            .send_put_block(flush.chunk_count, flush.flush_len, is_final_chunk)
+                            .send_write_chunk(chunk_info.clone(), chunk_data, Some(put_block))
                             .await
                         {
                             Ok(receiver) => receiver,
@@ -384,50 +367,96 @@ impl BlockWriter {
                             receiver,
                             flush: Some(flush),
                         });
+                    } else {
+                        let receiver = match self
+                            .send_write_chunk(chunk_info.clone(), chunk_data, None)
+                            .await
+                        {
+                            Ok(receiver) => receiver,
+                            Err(err) => {
+                                resend_error = Some(err);
+                                resend_unacked = true;
+                                break;
+                            }
+                        };
+                        pending.push(PendingOperation {
+                            receiver,
+                            flush: None,
+                        });
+                        if let Some(flush) = flush {
+                            self.retry_window.track_put_block(flush.flush_len);
+                            let receiver = match self
+                                .send_put_block(flush.chunk_count, flush.flush_len, is_final_chunk)
+                                .await
+                            {
+                                Ok(receiver) => receiver,
+                                Err(err) => {
+                                    resend_error = Some(err);
+                                    resend_unacked = true;
+                                    break;
+                                }
+                            };
+                            pending.push(PendingOperation {
+                                receiver,
+                                flush: Some(flush),
+                            });
+                        }
                     }
                 }
-            }
 
-            if resend_unacked {
-                self.retry_unacked_tail(terminal_len, resend_error).await?;
-                continue;
-            }
+                if resend_unacked {
+                    self.retry_unacked_tail(terminal_len, resend_error).await?;
+                    return Ok::<(), Error>(());
+                }
 
-            if let Err(err) = self.await_pending_operations(pending).await {
-                self.retry_unacked_tail(terminal_len, Some(err)).await?;
-                continue;
-            }
+                if let Err(err) = self.await_pending_operations(pending).await {
+                    self.retry_unacked_tail(terminal_len, Some(err)).await?;
+                    return Ok(());
+                }
 
-            if self.state.should_wait_for_window() && self.state.acked_len() == 0 {
-                self.retry_unacked_tail(terminal_len, None).await?;
+                if self.state.should_wait_for_window() && self.state.acked_len() == 0 {
+                    self.retry_unacked_tail(terminal_len, None).await?;
+                }
+
+                Ok(())
             }
+            .instrument(span)
+            .await?;
         }
 
         Ok(())
     }
 
     async fn force_put_block(&mut self, flush_len: u64, eof: bool) -> Result<()> {
-        let flush = self.flush_submission(flush_len);
-        self.retry_window.track_put_block(flush.flush_len);
-        let receiver = match self
-            .send_put_block(flush.chunk_count, flush.flush_len, eof)
-            .await
-        {
-            Ok(receiver) => receiver,
-            Err(err) => {
-                self.retry_unacked_tail(Some(flush_len), Some(err)).await?;
-                return Ok(());
-            }
-        };
-        let pending = vec![PendingOperation {
-            receiver,
-            flush: Some(flush),
-        }];
+        async {
+            let flush = self.flush_submission(flush_len);
+            self.retry_window.track_put_block(flush.flush_len);
+            let receiver = match self
+                .send_put_block(flush.chunk_count, flush.flush_len, eof)
+                .await
+            {
+                Ok(receiver) => receiver,
+                Err(err) => {
+                    self.retry_unacked_tail(Some(flush_len), Some(err)).await?;
+                    return Ok(());
+                }
+            };
+            let pending = vec![PendingOperation {
+                receiver,
+                flush: Some(flush),
+            }];
 
-        if let Err(err) = self.await_pending_operations(pending).await {
-            self.retry_unacked_tail(Some(flush_len), Some(err)).await?;
+            if let Err(err) = self.await_pending_operations(pending).await {
+                self.retry_unacked_tail(Some(flush_len), Some(err)).await?;
+            }
+            Ok(())
         }
-        Ok(())
+        .instrument(tracing::info_span!(
+            "ozone.ratis.force_put_block",
+            flush_len,
+            eof
+        ))
+        .await
     }
 
     fn build_chunk_info(&mut self, offset: u64, chunk_len: u64) -> datanode::ChunkInfo {
@@ -481,51 +510,64 @@ impl BlockWriter {
         let target = self.target.as_ref().ok_or_else(|| {
             Error::InvalidState("block writer target missing for writeChunk".to_string())
         })?;
-        #[allow(deprecated)]
-        let request = datanode::ContainerCommandRequestProto {
-            cmd_type: datanode::Type::WriteChunk as i32,
-            trace_id: None,
-            container_id: target.container_id,
-            datanode_uuid: target.datanode_uuid.clone(),
-            pipeline_id: target.pipeline_id.clone(),
-            create_container: None,
-            read_container: None,
-            update_container: None,
-            delete_container: None,
-            list_container: None,
-            close_container: None,
-            put_block: None,
-            get_block: None,
-            delete_block: None,
-            list_block: None,
-            read_chunk: None,
-            write_chunk: Some(datanode::WriteChunkRequestProto {
-                block_id: target.datanode_block_id,
-                chunk_data: Some(chunk_info),
-                data: Some(data),
-                block: put_block,
-            }),
-            delete_chunk: None,
-            list_chunk: None,
-            put_small_file: None,
-            get_small_file: None,
-            get_committed_block_length: None,
-            encoded_token: target.token.clone(),
-            version: Some(CLIENT_VERSION),
-            finalize_block: None,
-            echo: None,
-            get_container_checksum_info: None,
-            read_block: None,
-        };
+        let span = tracing::info_span!(
+            "ozone.ratis.write_chunk",
+            container_id = target.container_id,
+            local_id = target.local_id,
+            chunk_offset = chunk_info.offset,
+            chunk_len = chunk_info.len,
+            piggyback_put_block = put_block.is_some()
+        );
 
-        self.manager()?
-            .send_async(
-                RequestType::Write(common::WriteRequestTypeProto {
-                    replication: common::ReplicationLevel::Majority as i32,
+        async {
+            #[allow(deprecated)]
+            let request = datanode::ContainerCommandRequestProto {
+                cmd_type: datanode::Type::WriteChunk as i32,
+                trace_id: current_ozone_trace_id(),
+                container_id: target.container_id,
+                datanode_uuid: target.datanode_uuid.clone(),
+                pipeline_id: target.pipeline_id.clone(),
+                create_container: None,
+                read_container: None,
+                update_container: None,
+                delete_container: None,
+                list_container: None,
+                close_container: None,
+                put_block: None,
+                get_block: None,
+                delete_block: None,
+                list_block: None,
+                read_chunk: None,
+                write_chunk: Some(datanode::WriteChunkRequestProto {
+                    block_id: target.datanode_block_id,
+                    chunk_data: Some(chunk_info),
+                    data: Some(data),
+                    block: put_block,
                 }),
-                Some(encode_container_command_message(&request)?),
-            )
-            .await
+                delete_chunk: None,
+                list_chunk: None,
+                put_small_file: None,
+                get_small_file: None,
+                get_committed_block_length: None,
+                encoded_token: target.token.clone(),
+                version: Some(CLIENT_VERSION),
+                finalize_block: None,
+                echo: None,
+                get_container_checksum_info: None,
+                read_block: None,
+            };
+
+            self.manager()?
+                .send_async(
+                    RequestType::Write(common::WriteRequestTypeProto {
+                        replication: common::ReplicationLevel::Majority as i32,
+                    }),
+                    Some(encode_container_command_message(&request)?),
+                )
+                .await
+        }
+        .instrument(span)
+        .await
     }
 
     async fn send_put_block(
@@ -537,68 +579,90 @@ impl BlockWriter {
         let target = self.target.as_ref().ok_or_else(|| {
             Error::InvalidState("block writer target missing for putBlock".to_string())
         })?;
-        #[allow(deprecated)]
-        let request = datanode::ContainerCommandRequestProto {
-            cmd_type: datanode::Type::PutBlock as i32,
-            trace_id: None,
-            container_id: target.container_id,
-            datanode_uuid: target.datanode_uuid.clone(),
-            pipeline_id: target.pipeline_id.clone(),
-            create_container: None,
-            read_container: None,
-            update_container: None,
-            delete_container: None,
-            list_container: None,
-            close_container: None,
-            put_block: Some(self.build_put_block_request(chunk_count, flush_len, eof)?),
-            get_block: None,
-            delete_block: None,
-            list_block: None,
-            read_chunk: None,
-            write_chunk: None,
-            delete_chunk: None,
-            list_chunk: None,
-            put_small_file: None,
-            get_small_file: None,
-            get_committed_block_length: None,
-            encoded_token: target.token.clone(),
-            version: Some(CLIENT_VERSION),
-            finalize_block: None,
-            echo: None,
-            get_container_checksum_info: None,
-            read_block: None,
-        };
+        let span = tracing::info_span!(
+            "ozone.ratis.put_block",
+            container_id = target.container_id,
+            local_id = target.local_id,
+            flush_len,
+            chunk_count,
+            eof
+        );
 
-        self.manager()?
-            .send_async(
-                RequestType::Write(common::WriteRequestTypeProto {
-                    replication: common::ReplicationLevel::Majority as i32,
-                }),
-                Some(encode_container_command_message(&request)?),
-            )
-            .await
+        async {
+            #[allow(deprecated)]
+            let request = datanode::ContainerCommandRequestProto {
+                cmd_type: datanode::Type::PutBlock as i32,
+                trace_id: current_ozone_trace_id(),
+                container_id: target.container_id,
+                datanode_uuid: target.datanode_uuid.clone(),
+                pipeline_id: target.pipeline_id.clone(),
+                create_container: None,
+                read_container: None,
+                update_container: None,
+                delete_container: None,
+                list_container: None,
+                close_container: None,
+                put_block: Some(self.build_put_block_request(chunk_count, flush_len, eof)?),
+                get_block: None,
+                delete_block: None,
+                list_block: None,
+                read_chunk: None,
+                write_chunk: None,
+                delete_chunk: None,
+                list_chunk: None,
+                put_small_file: None,
+                get_small_file: None,
+                get_committed_block_length: None,
+                encoded_token: target.token.clone(),
+                version: Some(CLIENT_VERSION),
+                finalize_block: None,
+                echo: None,
+                get_container_checksum_info: None,
+                read_block: None,
+            };
+
+            self.manager()?
+                .send_async(
+                    RequestType::Write(common::WriteRequestTypeProto {
+                        replication: common::ReplicationLevel::Majority as i32,
+                    }),
+                    Some(encode_container_command_message(&request)?),
+                )
+                .await
+        }
+        .instrument(span)
+        .await
     }
 
     async fn watch_for_commit(&self, log_index: u64) -> Result<()> {
-        self.manager()?
-            .send(
-                RequestType::Watch(common::WatchRequestTypeProto {
-                    index: log_index,
-                    replication: common::ReplicationLevel::MajorityCommitted as i32,
-                }),
-                None,
-            )
-            .await?;
-        Ok(())
+        let span = tracing::info_span!("ozone.ratis.watch_for_commit", log_index);
+        async {
+            self.manager()?
+                .send(
+                    RequestType::Watch(common::WatchRequestTypeProto {
+                        index: log_index,
+                        replication: common::ReplicationLevel::MajorityCommitted as i32,
+                    }),
+                    None,
+                )
+                .await?;
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     async fn await_container_success(&self, receiver: PendingReply) -> Result<u64> {
-        let reply = receiver
-            .await
-            .map_err(|_| Error::Ratis("ratis reply channel closed".to_string()))??;
-        let response = datanode::ContainerCommandResponseProto::decode(reply.payload.clone())?;
-        ensure_container_success(response)?;
-        Ok(reply.log_index)
+        async {
+            let reply = receiver
+                .await
+                .map_err(|_| Error::Ratis("ratis reply channel closed".to_string()))??;
+            let response = datanode::ContainerCommandResponseProto::decode(reply.payload.clone())?;
+            ensure_container_success(response)?;
+            Ok(reply.log_index)
+        }
+        .instrument(tracing::info_span!("ozone.ratis.await_reply"))
+        .await
     }
 
     fn committed_location(&self, length: u64) -> Result<ozone::KeyLocation> {
@@ -789,6 +853,14 @@ fn ensure_container_success(
     Ok(response)
 }
 
+fn write_window_limit(offset: usize, data_len: usize, stream_window_size: usize) -> usize {
+    if stream_window_size == 0 {
+        data_len
+    } else {
+        offset.saturating_add(stream_window_size).min(data_len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BlockWriter, BlockWriterState, FlushAction};
@@ -885,5 +957,16 @@ mod tests {
         writer.state.observe_write(6);
 
         assert_eq!(writer.committed_written_len(), 10);
+    }
+
+    #[test]
+    fn write_window_limit_caps_nonzero_window_at_remaining_data() {
+        assert_eq!(super::write_window_limit(8, 25, 10), 18);
+        assert_eq!(super::write_window_limit(20, 25, 10), 25);
+    }
+
+    #[test]
+    fn write_window_limit_zero_window_covers_remaining_data() {
+        assert_eq!(super::write_window_limit(8, 25, 0), 25);
     }
 }

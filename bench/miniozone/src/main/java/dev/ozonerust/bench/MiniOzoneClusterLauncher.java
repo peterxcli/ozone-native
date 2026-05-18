@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hdds.HddsConfigKeys;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
@@ -39,6 +40,8 @@ public final class MiniOzoneClusterLauncher {
     conf.setBoolean(OMConfigKeys.OZONE_OM_S3_GPRC_SERVER_ENABLED, true);
     conf.setBoolean(HddsConfigKeys.HDDS_BLOCK_TOKEN_ENABLED, false);
     conf.set("ozone.server.default.replication", Integer.toString(replication));
+    conf.setBoolean("ozone.tracing.enabled", boolEnv("OZONE_BENCH_OTEL",
+        false));
     conf.setTimeDuration("hdds.heartbeat.interval", 1, TimeUnit.SECONDS);
     conf.setTimeDuration("ozone.scm.pipeline.creation.interval", 1,
         TimeUnit.SECONDS);
@@ -85,6 +88,25 @@ public final class MiniOzoneClusterLauncher {
       throw new IllegalArgumentException(name + " must be positive");
     }
     return parsed;
+  }
+
+  private static boolean boolEnv(String name, boolean defaultValue) {
+    String value = System.getenv(name);
+    if (value == null || value.trim().isEmpty()) {
+      return defaultValue;
+    }
+    switch (value.toLowerCase(Locale.ROOT)) {
+    case "1":
+    case "true":
+    case "yes":
+      return true;
+    case "0":
+    case "false":
+    case "no":
+      return false;
+    default:
+      return defaultValue;
+    }
   }
 
   private static int replicationEnv(String name, int defaultValue) {
