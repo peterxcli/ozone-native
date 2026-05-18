@@ -51,7 +51,9 @@ crate, not that every edge case has production-grade coverage yet.
 - [ ] Erasure-coded reads and writes
 - [ ] True streaming file reads from the public `FileReader`
 - [x] True streaming file writes from the public `FileWriter`
-- [ ] Pooled block writes
+- [x] Pooled block writes
+- [ ] HA and failover discovery
+- [ ] Pluggable Concurrency Model
 
 ### HDFS-compatible client surface
 
@@ -83,7 +85,6 @@ crate, not that every edge case has production-grade coverage yet.
 - [x] `ozone.max.write.retries`
 - [x] `ozone.enable.put.block.piggybacking`
 - [x] `ozone.host.override`
-- [ ] Ozone Manager HA and failover discovery
 - [ ] Kerberos, delegation tokens, and SASL authentication
 - [ ] TLS/auth configuration beyond endpoint transport support
 
