@@ -266,6 +266,10 @@ impl OzoneClient {
             .await
     }
 
+    pub(crate) fn max_write_retries(&self) -> usize {
+        self.config.max_write_retries
+    }
+
     async fn write_open_key_bytes(
         &self,
         volume: &str,

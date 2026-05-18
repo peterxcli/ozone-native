@@ -62,12 +62,12 @@ pub fn init(service_name: &'static str) -> Option<BenchTracing> {
     Some(BenchTracing { provider })
 }
 
-fn bool_env(name: &str, default: bool) -> bool {
+pub(crate) fn bool_env(name: &str, default: bool) -> bool {
     env::var(name)
         .ok()
-        .and_then(|value| match value.as_str() {
-            "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
-            "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
+        .and_then(|value| match value.to_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
             _ => None,
         })
         .unwrap_or(default)

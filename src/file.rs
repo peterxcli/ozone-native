@@ -2,7 +2,7 @@ use crate::api::{Client, WriteOptions};
 use crate::block_entry_pool::BlockEntryPool;
 use crate::client::OzoneClient;
 use crate::error::{Error, Result};
-use crate::om::{KeyReplication, OpenKeySession};
+use crate::om::{BlockAllocateExcludeList, KeyReplication, OpenKeySession};
 use crate::proto::hadoop::ozone;
 use crate::status::FileStatus;
 use crate::util::{key_replication, latest_key_locations, DEFAULT_BLOCK_SIZE};
@@ -243,7 +243,7 @@ impl FileWriter {
     async fn ensure_current_block(&mut self) -> Result<()> {
         if self.pool.needs_current_allocation() {
             let location = self
-                .allocate_block()
+                .allocate_block(None)
                 .instrument(tracing::info_span!(
                     "ozone.file.allocate_current_block",
                     file_offset = self.bytes_written
@@ -257,7 +257,7 @@ impl FileWriter {
     async fn ensure_lookahead(&mut self) -> Result<()> {
         if self.pool.needs_lookahead() {
             let location = self
-                .allocate_block()
+                .allocate_block(None)
                 .instrument(tracing::info_span!(
                     "ozone.file.allocate_lookahead_block",
                     file_offset = self.bytes_written
@@ -268,7 +268,10 @@ impl FileWriter {
         Ok(())
     }
 
-    async fn allocate_block(&self) -> Result<ozone::KeyLocation> {
+    async fn allocate_block(
+        &self,
+        exclude: Option<&BlockAllocateExcludeList>,
+    ) -> Result<ozone::KeyLocation> {
         let open = self
             .open
             .as_ref()
@@ -281,19 +284,32 @@ impl FileWriter {
                 self.bytes_written,
                 open.id,
                 &self.replication,
-                None,
+                exclude,
             )
             .await
     }
 
     async fn write_current_slice(&mut self, data: &[u8]) -> Result<()> {
         self.ensure_current_writer().await?;
-        let current = self
-            .pool
-            .current_block_mut()
-            .ok_or_else(|| Error::InvalidState("current block missing".to_string()))?;
-        current.write(data).await?;
-        Ok(())
+        let write_result = {
+            let current = self
+                .pool
+                .current_block_mut()
+                .ok_or_else(|| Error::InvalidState("current block missing".to_string()))?;
+            current.write(data).await
+        };
+
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let mut exclude = BlockAllocateExcludeList::default();
+                if let Some(location) = self.pool.current_location() {
+                    add_location_pipeline_to_exclude(location, &mut exclude);
+                }
+                self.replace_current_block_with_replay(&mut exclude, Some(err))
+                    .await
+            }
+        }
     }
 
     async fn ensure_current_writer(&mut self) -> Result<()> {
@@ -318,16 +334,79 @@ impl FileWriter {
     }
 
     async fn close_current_block(&mut self) -> Result<()> {
-        let Some(current) = self.pool.current_block_mut() else {
-            return Ok(());
-        };
-        current
-            .close()
-            .instrument(tracing::info_span!(
-                "ozone.file.close_current_block",
-                file_offset = self.bytes_written
-            ))
-            .await
+        let mut exclude = BlockAllocateExcludeList::default();
+        loop {
+            let Some(current) = self.pool.current_block_mut() else {
+                return Ok(());
+            };
+            let close_result = current
+                .close()
+                .instrument(tracing::info_span!(
+                    "ozone.file.close_current_block",
+                    file_offset = self.bytes_written
+                ))
+                .await;
+
+            match close_result {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if let Some(location) = self.pool.current_location() {
+                        add_location_pipeline_to_exclude(location, &mut exclude);
+                    }
+                    self.replace_current_block_with_replay(&mut exclude, Some(err))
+                        .await?;
+                }
+            }
+        }
+    }
+
+    async fn replace_current_block_with_replay(
+        &mut self,
+        exclude: &mut BlockAllocateExcludeList,
+        initial_error: Option<Error>,
+    ) -> Result<()> {
+        let data = self
+            .pool
+            .current_replay_data()
+            .ok_or_else(|| Error::InvalidState("current block missing".to_string()))?;
+        let mut last_error = initial_error;
+
+        for _ in 0..self.client.max_write_retries() {
+            let location = self
+                .allocate_block(Some(exclude))
+                .instrument(tracing::info_span!(
+                    "ozone.file.replace_current_block",
+                    file_offset = self.bytes_written,
+                    replay_len = data.len()
+                ))
+                .await?;
+            match self.replay_current_block(&location, &data).await {
+                Ok(writer) => {
+                    self.pool
+                        .replace_current_with_replay(location, writer, data.clone())?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    add_location_pipeline_to_exclude(&location, exclude);
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| Error::Ratis("exhausted block replacement attempts".to_string())))
+    }
+
+    async fn replay_current_block(
+        &self,
+        location: &ozone::KeyLocation,
+        data: &[u8],
+    ) -> Result<crate::block_writer::BlockWriter> {
+        let mut writer = self.client.create_block_writer(location).await?;
+        if !data.is_empty() {
+            writer.write(data).await?;
+        }
+        Ok(writer)
     }
 }
 
@@ -336,6 +415,15 @@ fn effective_block_size(options: &WriteOptions) -> u64 {
         .block_size
         .filter(|block_size| *block_size > 0)
         .unwrap_or(DEFAULT_BLOCK_SIZE)
+}
+
+fn add_location_pipeline_to_exclude(
+    location: &ozone::KeyLocation,
+    exclude: &mut BlockAllocateExcludeList,
+) {
+    if let Some(pipeline) = location.pipeline.as_ref() {
+        exclude.pipeline_ids.push(pipeline.id.clone());
+    }
 }
 
 #[derive(Clone)]

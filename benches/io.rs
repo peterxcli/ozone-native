@@ -40,7 +40,7 @@ impl BenchEnv {
                 "OZONE_BENCH_NATIVE_CHUNK_SIZE",
                 ClientConfig::default().chunk_size,
             ),
-            watch_for_commit: bool_env("OZONE_BENCH_WATCH_FOR_COMMIT", false),
+            watch_for_commit: bench_tracing::bool_env("OZONE_BENCH_WATCH_FOR_COMMIT", false),
             native_max_write_retries: usize_env(
                 "OZONE_BENCH_NATIVE_MAX_WRITE_RETRIES",
                 DEFAULT_NATIVE_MAX_WRITE_RETRIES,
@@ -53,17 +53,6 @@ fn usize_env(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn bool_env(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
-        .and_then(|value| match value.as_str() {
-            "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
-            "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
-            _ => None,
-        })
         .unwrap_or(default)
 }
 

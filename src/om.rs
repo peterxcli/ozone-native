@@ -18,31 +18,17 @@ pub struct OmClient {
 mod tests {
     use super::*;
     use crate::proto::hadoop::hdds;
-    use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::prelude::*;
 
     #[tokio::test]
-    async fn om_request_uses_active_opentelemetry_context_as_trace_id() {
-        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        let tracer = provider.tracer("ozone-rust-test");
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    async fn om_request_leaves_trace_id_for_submit() {
         let client = OmClient {
             channel: Channel::from_static("http://127.0.0.1:9876").connect_lazy(),
             client_id: "client-1".to_string(),
         };
 
-        tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("get-file-status");
-            let _guard = span.enter();
-            let request = client.request(ozone::Type::GetFileStatus);
-            let trace_id = request.trace_id.expect("trace id");
+        let request = client.request(ozone::Type::GetFileStatus);
 
-            assert!(trace_id.starts_with("traceparent=00-"));
-            assert!(trace_id.ends_with(';'));
-        });
-
-        provider.shutdown().expect("shutdown tracer provider");
+        assert!(request.trace_id.is_none());
     }
 
     #[test]
@@ -185,7 +171,7 @@ impl OmClient {
     fn request(&self, cmd_type: ozone::Type) -> Box<ozone::OmRequest> {
         Box::new(ozone::OmRequest {
             cmd_type: cmd_type as i32,
-            trace_id: current_ozone_trace_id(),
+            trace_id: None,
             client_id: self.client_id.clone(),
             user_info: None,
             version: Some(CLIENT_VERSION),

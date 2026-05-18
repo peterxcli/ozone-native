@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hdds.HddsConfigKeys;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
@@ -94,18 +95,14 @@ public final class MiniOzoneClusterLauncher {
     if (value == null || value.trim().isEmpty()) {
       return defaultValue;
     }
-    switch (value) {
+    switch (value.toLowerCase(Locale.ROOT)) {
     case "1":
     case "true":
-    case "TRUE":
     case "yes":
-    case "YES":
       return true;
     case "0":
     case "false":
-    case "FALSE":
     case "no":
-    case "NO":
       return false;
     default:
       return defaultValue;

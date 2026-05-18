@@ -1,6 +1,7 @@
 use crate::block_writer::BlockWriter;
 use crate::error::{Error, Result};
 use crate::proto::hadoop::ozone;
+use bytes::{Bytes, BytesMut};
 
 #[derive(Clone, Copy, Debug)]
 struct ActiveBlockProgress {
@@ -48,6 +49,7 @@ pub(crate) struct WritableBlock {
     location: ozone::KeyLocation,
     writer: Option<BlockWriter>,
     progress: ActiveBlockProgress,
+    data: BytesMut,
     closed: bool,
 }
 
@@ -57,8 +59,22 @@ impl WritableBlock {
             progress: ActiveBlockProgress::from_location_len(location.length, fallback_capacity),
             location,
             writer: None,
+            data: BytesMut::new(),
             closed: false,
         }
+    }
+
+    fn from_replay(
+        location: ozone::KeyLocation,
+        writer: BlockWriter,
+        fallback_capacity: u64,
+        data: Bytes,
+    ) -> Self {
+        let mut block = Self::new(location, fallback_capacity);
+        block.writer = Some(writer);
+        block.progress.observe_write(data.len() as u64);
+        block.data = BytesMut::from(data.as_ref());
+        block
     }
 
     pub(crate) fn next_write_len(&self, requested: usize) -> usize {
@@ -98,9 +114,14 @@ impl WritableBlock {
             .writer
             .as_mut()
             .ok_or_else(|| Error::InvalidState("active block writer missing".to_string()))?;
+        self.data.extend_from_slice(data);
         writer.write(data).await?;
         self.observe_write(data.len());
         Ok(())
+    }
+
+    pub(crate) fn replay_data(&self) -> Bytes {
+        self.data.clone().freeze()
     }
 
     pub(crate) fn is_full(&self) -> bool {
@@ -139,6 +160,7 @@ impl WritableBlock {
     fn update_committed_location(&mut self, mut location: ozone::KeyLocation) {
         location.length = self.progress.written;
         self.location = location;
+        self.data = BytesMut::new();
         self.closed = true;
     }
 
@@ -186,6 +208,24 @@ impl BlockEntryPool {
         self.current_block().map(|block| &block.location)
     }
 
+    pub(crate) fn current_replay_data(&self) -> Option<Bytes> {
+        self.current_block().map(WritableBlock::replay_data)
+    }
+
+    pub(crate) fn replace_current_with_replay(
+        &mut self,
+        location: ozone::KeyLocation,
+        writer: BlockWriter,
+        data: Bytes,
+    ) -> Result<()> {
+        let current = self
+            .blocks
+            .get_mut(self.current_index)
+            .ok_or_else(|| Error::InvalidState("current block missing".to_string()))?;
+        *current = WritableBlock::from_replay(location, writer, self.block_size, data);
+        Ok(())
+    }
+
     pub(crate) fn needs_current_allocation(&self) -> bool {
         self.current_index >= self.blocks.len()
     }
@@ -223,6 +263,7 @@ mod tests {
     use super::{ActiveBlockProgress, BlockEntryPool, WritableBlock};
     use crate::block_writer::BlockWriter;
     use crate::proto::hadoop::{hdds, ozone};
+    use bytes::Bytes;
 
     fn location(local_id: i64, len: u64) -> ozone::KeyLocation {
         ozone::KeyLocation {
@@ -297,6 +338,48 @@ mod tests {
 
         assert!(!block.needs_writer());
         assert!(block.committed_location().is_none());
+    }
+
+    #[tokio::test]
+    async fn writable_block_keeps_failed_write_data_for_replay() {
+        let mut block = WritableBlock::new(location(1, 8), 8);
+        block.attach_writer(BlockWriter::for_test(4, 8)).unwrap();
+
+        assert!(block.write(b"test").await.is_err());
+
+        assert_eq!(block.replay_data(), Bytes::from_static(b"test"));
+    }
+
+    #[test]
+    fn writable_block_releases_replay_data_after_commit() {
+        let mut block = WritableBlock::new(location(1, 8), 8);
+        block.data.extend_from_slice(b"test");
+        block.observe_write(4);
+
+        block.update_committed_location(location(1, 8));
+
+        assert_eq!(block.replay_data(), Bytes::new());
+    }
+
+    #[test]
+    fn block_entry_pool_replaces_current_with_replayed_progress() {
+        let mut pool = BlockEntryPool::new(vec![location(1, 8)], 8);
+        pool.replace_current_with_replay(
+            location(2, 8),
+            BlockWriter::for_test(4, 8),
+            Bytes::from_static(b"test"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pool.current_location()
+                .unwrap()
+                .block_id
+                .container_block_id
+                .local_id,
+            2
+        );
+        assert_eq!(pool.current_block().unwrap().next_write_len(8), 4);
     }
 
     #[test]
