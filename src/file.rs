@@ -1,12 +1,12 @@
 use crate::api::{Client, WriteOptions};
-use crate::block_writer::BlockWriter;
+use crate::block_entry_pool::BlockEntryPool;
 use crate::client::OzoneClient;
 use crate::error::{Error, Result};
-use crate::om::{BlockAllocateExcludeList, KeyReplication, OpenKeySession};
+use crate::om::{KeyReplication, OpenKeySession};
 use crate::proto::hadoop::ozone;
 use crate::status::FileStatus;
 use crate::util::{key_replication, latest_key_locations, DEFAULT_BLOCK_SIZE};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::stream::{self, BoxStream};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -96,84 +96,9 @@ pub struct FileWriter {
     key: String,
     replication: KeyReplication,
     open: Option<OpenKeySession>,
-    pending: VecDeque<ozone::KeyLocation>,
-    active: Option<ActiveBlock>,
-    committed: Vec<ozone::KeyLocation>,
-    block_size: u64,
+    pool: BlockEntryPool,
     bytes_written: u64,
     closed: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ActiveBlockProgress {
-    capacity: Option<u64>,
-    written: u64,
-}
-
-impl ActiveBlockProgress {
-    fn bounded(capacity: u64) -> Self {
-        Self {
-            capacity: Some(capacity),
-            written: 0,
-        }
-    }
-
-    fn from_location_len(len: u64, fallback_capacity: u64) -> Self {
-        if len > 0 {
-            Self::bounded(len)
-        } else {
-            Self::bounded(fallback_capacity.max(1))
-        }
-    }
-
-    fn next_write_len(&self, requested: usize) -> usize {
-        self.remaining()
-            .map(|remaining| requested.min(remaining as usize))
-            .unwrap_or(requested)
-    }
-
-    fn observe_write(&mut self, len: u64) {
-        self.written += len;
-    }
-
-    fn is_full(&self) -> bool {
-        self.remaining() == Some(0)
-    }
-
-    fn remaining(&self) -> Option<u64> {
-        self.capacity
-            .map(|capacity| capacity.saturating_sub(self.written))
-    }
-}
-
-struct ActiveBlock {
-    location: ozone::KeyLocation,
-    writer: Option<BlockWriter>,
-    progress: ActiveBlockProgress,
-    data: BytesMut,
-}
-
-impl ActiveBlock {
-    fn new(location: ozone::KeyLocation, writer: BlockWriter, fallback_capacity: u64) -> Self {
-        Self {
-            progress: ActiveBlockProgress::from_location_len(location.length, fallback_capacity),
-            location,
-            writer: Some(writer),
-            data: BytesMut::new(),
-        }
-    }
-
-    fn next_write_len(&self, requested: usize) -> usize {
-        self.progress.next_write_len(requested)
-    }
-
-    fn observe_write(&mut self, len: usize) {
-        self.progress.observe_write(len as u64);
-    }
-
-    fn is_full(&self) -> bool {
-        self.progress.is_full()
-    }
 }
 
 impl FileWriter {
@@ -213,7 +138,7 @@ impl FileWriter {
         block_size: u64,
     ) -> Self {
         let (replication_type, factor, ec_replication) = key_replication(&open.key_info);
-        let pending = latest_key_locations(&open.key_info).into();
+        let locations = latest_key_locations(&open.key_info);
         Self {
             client,
             volume,
@@ -225,10 +150,7 @@ impl FileWriter {
                 ec_replication,
             },
             open: Some(open),
-            pending,
-            active: None,
-            committed: Vec::new(),
-            block_size,
+            pool: BlockEntryPool::new(locations, block_size),
             bytes_written: 0,
             closed: false,
         }
@@ -244,25 +166,33 @@ impl FileWriter {
         let len = buf.len();
         let mut offset = 0usize;
         while offset < len {
-            self.ensure_active_block().await?;
+            self.ensure_current_block().await?;
+            if let Err(err) = self.ensure_lookahead().await {
+                tracing::warn!(
+                    error = %err,
+                    "failed to preallocate lookahead block; continuing with current block"
+                );
+            }
             let write_len = self
-                .active
-                .as_ref()
-                .expect("active block")
+                .pool
+                .current_block()
+                .expect("current block")
                 .next_write_len(len - offset);
 
             if write_len == 0 {
-                self.close_active_block().await?;
+                self.close_current_block().await?;
+                self.pool.advance_past_full_current();
                 continue;
             }
 
-            self.write_active_slice(&buf[offset..offset + write_len])
+            self.write_current_slice(&buf[offset..offset + write_len])
                 .await?;
             self.bytes_written += write_len as u64;
             offset += write_len;
 
-            if self.active.as_ref().is_some_and(ActiveBlock::is_full) {
-                self.close_active_block().await?;
+            if self.pool.current_is_full() {
+                self.close_current_block().await?;
+                self.pool.advance_past_full_current();
             }
         }
         Ok(len)
@@ -270,7 +200,7 @@ impl FileWriter {
 
     pub async fn close(&mut self) -> Result<()> {
         if !self.closed {
-            self.close_active_block().await?;
+            self.close_current_block().await?;
             let open_id = self
                 .open
                 .as_ref()
@@ -283,7 +213,7 @@ impl FileWriter {
                     &self.key,
                     self.bytes_written,
                     open_id,
-                    self.committed.clone(),
+                    self.pool.committed_locations(),
                     &self.replication,
                 )
                 .await?;
@@ -293,24 +223,23 @@ impl FileWriter {
         Ok(())
     }
 
-    async fn ensure_active_block(&mut self) -> Result<()> {
-        if self.active.is_some() {
-            return Ok(());
+    async fn ensure_current_block(&mut self) -> Result<()> {
+        if self.pool.needs_current_allocation() {
+            let location = self.allocate_block().await?;
+            self.pool.push_block(location);
         }
-
-        let location = match self.pending.pop_front() {
-            Some(location) => location,
-            None => self.allocate_block(None).await?,
-        };
-        let writer = self.client.create_block_writer(&location).await?;
-        self.active = Some(ActiveBlock::new(location, writer, self.block_size));
         Ok(())
     }
 
-    async fn allocate_block(
-        &self,
-        exclude: Option<&BlockAllocateExcludeList>,
-    ) -> Result<ozone::KeyLocation> {
+    async fn ensure_lookahead(&mut self) -> Result<()> {
+        if self.pool.needs_lookahead() {
+            let location = self.allocate_block().await?;
+            self.pool.push_block(location);
+        }
+        Ok(())
+    }
+
+    async fn allocate_block(&self) -> Result<ozone::KeyLocation> {
         let open = self
             .open
             .as_ref()
@@ -323,119 +252,47 @@ impl FileWriter {
                 self.bytes_written,
                 open.id,
                 &self.replication,
-                exclude,
+                None,
             )
             .await
     }
 
-    async fn write_active_slice(&mut self, data: &[u8]) -> Result<()> {
-        {
-            let active = self
-                .active
-                .as_mut()
-                .ok_or_else(|| Error::InvalidState("active file block missing".to_string()))?;
-            active.data.extend_from_slice(data);
-        }
+    async fn write_current_slice(&mut self, data: &[u8]) -> Result<()> {
+        self.ensure_current_writer().await?;
+        let current = self
+            .pool
+            .current_block_mut()
+            .ok_or_else(|| Error::InvalidState("current block missing".to_string()))?;
+        current.write(data).await?;
+        Ok(())
+    }
 
-        let write_result = {
-            let active = self
-                .active
-                .as_mut()
-                .ok_or_else(|| Error::InvalidState("active file block missing".to_string()))?;
-            let writer = active
-                .writer
-                .as_mut()
-                .ok_or_else(|| Error::InvalidState("active block writer missing".to_string()))?;
-            writer.write(data).await
+    async fn ensure_current_writer(&mut self) -> Result<()> {
+        let needs_writer = self
+            .pool
+            .current_block()
+            .ok_or_else(|| Error::InvalidState("current block missing".to_string()))?
+            .needs_writer();
+        if needs_writer {
+            let location = self
+                .pool
+                .current_location()
+                .ok_or_else(|| Error::InvalidState("current block location missing".to_string()))?
+                .clone();
+            let writer = self.client.create_block_writer(&location).await?;
+            self.pool
+                .current_block_mut()
+                .ok_or_else(|| Error::InvalidState("current block missing".to_string()))?
+                .attach_writer(writer)?;
+        }
+        Ok(())
+    }
+
+    async fn close_current_block(&mut self) -> Result<()> {
+        let Some(current) = self.pool.current_block_mut() else {
+            return Ok(());
         };
-
-        match write_result {
-            Ok(()) => {
-                if let Some(active) = self.active.as_mut() {
-                    active.observe_write(data.len());
-                }
-                Ok(())
-            }
-            Err(err) => {
-                let mut exclude = BlockAllocateExcludeList::default();
-                if let Some(active) = self.active.as_ref() {
-                    add_location_pipeline_to_exclude(&active.location, &mut exclude);
-                }
-                self.replace_active_block_with_replay(&mut exclude, Some(err))
-                    .await
-            }
-        }
-    }
-
-    async fn close_active_block(&mut self) -> Result<()> {
-        let mut exclude = BlockAllocateExcludeList::default();
-        loop {
-            let Some(mut active) = self.active.take() else {
-                return Ok(());
-            };
-            let writer = active
-                .writer
-                .take()
-                .ok_or_else(|| Error::InvalidState("active block writer missing".to_string()))?;
-            match writer.close().await {
-                Ok(location) => {
-                    self.committed.push(location);
-                    return Ok(());
-                }
-                Err(err) => {
-                    add_location_pipeline_to_exclude(&active.location, &mut exclude);
-                    self.active = Some(active);
-                    self.replace_active_block_with_replay(&mut exclude, Some(err))
-                        .await?;
-                }
-            }
-        }
-    }
-
-    async fn replace_active_block_with_replay(
-        &mut self,
-        exclude: &mut BlockAllocateExcludeList,
-        initial_error: Option<Error>,
-    ) -> Result<()> {
-        let data = self
-            .active
-            .as_ref()
-            .ok_or_else(|| Error::InvalidState("active file block missing".to_string()))?
-            .data
-            .clone();
-        let mut last_error = initial_error;
-
-        for _ in 0..=self.client.max_write_retries() {
-            let location = self.allocate_block(Some(exclude)).await?;
-            match self.replay_active_block(location.clone(), &data).await {
-                Ok(active) => {
-                    self.active = Some(active);
-                    return Ok(());
-                }
-                Err(err) => {
-                    add_location_pipeline_to_exclude(&location, exclude);
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        Err(last_error
-            .unwrap_or_else(|| Error::Ratis("exhausted block replacement attempts".to_string())))
-    }
-
-    async fn replay_active_block(
-        &self,
-        location: ozone::KeyLocation,
-        data: &[u8],
-    ) -> Result<ActiveBlock> {
-        let mut writer = self.client.create_block_writer(&location).await?;
-        if !data.is_empty() {
-            writer.write(data).await?;
-        }
-        let mut active = ActiveBlock::new(location, writer, self.block_size);
-        active.data.extend_from_slice(data);
-        active.observe_write(data.len());
-        Ok(active)
+        current.close().await
     }
 }
 
@@ -444,15 +301,6 @@ fn effective_block_size(options: &WriteOptions) -> u64 {
         .block_size
         .filter(|block_size| *block_size > 0)
         .unwrap_or(DEFAULT_BLOCK_SIZE)
-}
-
-fn add_location_pipeline_to_exclude(
-    location: &ozone::KeyLocation,
-    exclude: &mut BlockAllocateExcludeList,
-) {
-    if let Some(pipeline) = location.pipeline.as_ref() {
-        exclude.pipeline_ids.push(pipeline.id.clone());
-    }
 }
 
 #[derive(Clone)]
@@ -537,7 +385,7 @@ impl ListStatusIterator {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveBlockProgress, FileReader};
+    use super::FileReader;
     use bytes::Bytes;
     use futures::StreamExt;
 
@@ -597,39 +445,5 @@ mod tests {
     async fn range_past_end_panics() {
         let reader = FileReader::new(b"abc".to_vec());
         let _ = reader.read_range(2, 2).await;
-    }
-
-    #[test]
-    fn active_block_progress_caps_writes_at_remaining_capacity() {
-        let mut progress = ActiveBlockProgress::bounded(10);
-
-        assert_eq!(progress.next_write_len(6), 6);
-        progress.observe_write(6);
-        assert_eq!(progress.next_write_len(10), 4);
-        progress.observe_write(4);
-
-        assert!(progress.is_full());
-        assert_eq!(progress.next_write_len(1), 0);
-    }
-
-    #[test]
-    fn active_block_progress_caps_zero_length_locations_at_block_size() {
-        let mut progress = ActiveBlockProgress::from_location_len(0, 16);
-
-        assert_eq!(progress.next_write_len(16), 16);
-        progress.observe_write(16);
-
-        assert!(progress.is_full());
-        assert_eq!(progress.next_write_len(8), 0);
-    }
-
-    #[test]
-    fn active_block_progress_prefers_nonzero_location_len() {
-        let mut progress = ActiveBlockProgress::from_location_len(8, 16);
-
-        assert_eq!(progress.next_write_len(16), 8);
-        progress.observe_write(8);
-
-        assert!(progress.is_full());
     }
 }

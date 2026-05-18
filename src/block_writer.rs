@@ -278,7 +278,7 @@ impl BlockWriter {
         self.write_inner(data, false).await
     }
 
-    pub async fn close(mut self) -> Result<ozone::KeyLocation> {
+    pub async fn close(&mut self) -> Result<ozone::KeyLocation> {
         let written_len = self.state.written_len();
         if written_len > 0 {
             self.force_put_block(written_len, true).await?;

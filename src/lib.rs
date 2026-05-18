@@ -1,5 +1,6 @@
 mod acl;
 mod api;
+mod block_entry_pool;
 mod block_writer;
 mod client;
 mod datanode;
