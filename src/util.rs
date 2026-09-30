@@ -261,6 +261,7 @@ mod tests {
                 }),
                 data: Some(b"abc".to_vec()),
                 block: None,
+                container_auto_create: None,
             }),
             delete_chunk: None,
             list_chunk: None,
@@ -361,7 +362,6 @@ mod tests {
             owner_name: None,
             tags: Vec::new(),
             expected_data_generation: None,
-            expected_e_tag: None,
         };
 
         assert_eq!(latest_key_locations(&key_info), vec![second]);

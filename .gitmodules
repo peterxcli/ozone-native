@@ -1,10 +1,10 @@
 [submodule "ozone"]
 	path = ozone
 	url = https://github.com/apache/ozone.git
-	branch = master
+	branch = ozone-2.2.1
 	shallow = true
 [submodule "ratis"]
 	path = ratis
 	url = https://github.com/apache/ratis.git
-	branch = master
+	branch = release-3.3.1
 	shallow = true

@@ -469,6 +469,7 @@ impl BlockWriter {
                 size: Some(flush_len as i64),
             },
             eof: Some(eof),
+            container_auto_create: None,
         })
     }
 
@@ -504,6 +505,7 @@ impl BlockWriter {
                 chunk_data: Some(chunk_info),
                 data: Some(data),
                 block: put_block,
+                container_auto_create: None,
             }),
             delete_chunk: None,
             list_chunk: None,
