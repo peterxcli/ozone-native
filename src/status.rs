@@ -80,7 +80,6 @@ mod tests {
             owner_name: Some("owner".to_string()),
             tags: Vec::new(),
             expected_data_generation: None,
-            expected_e_tag: None,
         }
     }
 

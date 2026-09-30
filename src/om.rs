@@ -246,6 +246,7 @@ impl OmClient {
             refetch_secret_key_request: None,
             list_snapshot_diff_job_request: None,
             cancel_snapshot_diff_request: None,
+            submit_snapshot_diff_request: None,
             set_safe_mode_request: None,
             print_compaction_log_dag_request: None,
             multipart_uploads_expired_abort_request: None,
@@ -859,7 +860,6 @@ impl OmClient {
                     owner_name: basic.owner_name,
                     tags: Vec::new(),
                     expected_data_generation: None,
-                    expected_e_tag: basic.e_tag,
                 })
                 .collect());
         }

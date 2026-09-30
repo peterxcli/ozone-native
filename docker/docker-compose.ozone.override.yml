@@ -1,24 +1,24 @@
 services:
   om:
     volumes:
-      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.0-SNAPSHOT:/opt/hadoop
+      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.1:/opt/hadoop
     ports:
       - "8981:8981"
   datanode:
     volumes:
-      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.0-SNAPSHOT:/opt/hadoop
+      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.1:/opt/hadoop
     ports:
       - "9858:9858"
       - "9859:9859"
   scm:
     volumes:
-      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.0-SNAPSHOT:/opt/hadoop
+      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.1:/opt/hadoop
   httpfs:
     volumes:
-      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.0-SNAPSHOT:/opt/hadoop
+      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.1:/opt/hadoop
   s3g:
     volumes:
-      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.0-SNAPSHOT:/opt/hadoop
+      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.1:/opt/hadoop
   recon:
     volumes:
-      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.0-SNAPSHOT:/opt/hadoop
+      - /Users/lixucheng/Documents/oss/apache/ozone/hadoop-ozone/dist/target/ozone-2.2.1:/opt/hadoop

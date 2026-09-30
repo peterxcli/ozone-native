@@ -635,7 +635,6 @@ fn basic_key_info_to_key_info(
         owner_name: basic.owner_name,
         tags: Vec::new(),
         expected_data_generation: None,
-        expected_e_tag: basic.e_tag,
     }
 }
 
@@ -851,7 +850,6 @@ mod tests {
                 owner_name: None,
                 tags: Vec::new(),
                 expected_data_generation: None,
-                expected_e_tag: None,
             }),
             block_size: None,
             is_directory: Some(false),
